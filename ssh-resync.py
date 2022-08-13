@@ -106,6 +106,9 @@ class Utils:
         self.raw_print(text + "\n", target)
 
     def debug(self, text, level=0, timestamp=True):
+        if not isinstance(text, str):
+            text = str(text)
+
         if verbose_level >= level:
             leading_spaces = len(text) - len(text.lstrip())
             leading_str = ' ' * leading_spaces
@@ -129,13 +132,14 @@ class SSH:
     __failed_auth_methods = []
     __auth_method = None
     __host = None
-    __jump_host = None
     __user = None
     __identity = None
     __password = None
     __conn = None
+    __resolves = {}
     __known_hosts = None
     __host_keys_filepath = None
+    __host_keys_filepath_stats = None
     __host_keys_backup_filepath = None
     __host_keys = None
     __host_list_filepath = None
@@ -150,93 +154,36 @@ class SSH:
         if self.__host_keys is not None and os.path.isfile(hosts_filepath):
             self.__host_list_filepath = hosts_filepath
 
-            if self.__known_hosts is None:
-                self.__known_hosts = {}
-
-            resolves = {}
             foundItems = []
-            foundIps = []
             host_keys_changes = False
 
             with open(hosts_filepath, 'r') as f:
-                oldDefaultTimeout = socket.getdefaulttimeout()
-                socket.setdefaulttimeout(0.5)
+                utils.debug('Parsing hosts list file: %s' %(hosts_filepath), 1)
                 for line in f.readlines():
                     fields = line.split()
                     for i in range(0, len(fields)):
-                        host = {'ips': [], 'hostnames': [], 'reachable': False, 'jump_host': None, 'key': None, 'replaced_key': False}
-                        tmp_keys = None
+                        hostnames = None
 
-                        fingerPrint = None
-                        ip = None
-                        hostname = None
                         item = fields[i]
-                        if item == '#':
+                        if item.startswith('#'):
                             break
 
                         if item not in foundItems:
                             utils.debug('Searching for %s in %s' %(item, self.__host_keys_filepath), 4)
-                            tmp_keys = self.__host_keys.lookup(item)
-                            if tmp_keys is not None:
-                                utils.debug('Found item <%s> in %s' %(item, self.__host_keys_filepath), 2)
+                            hostnames = self.lookupKnownHosts(item)
+                            if hostnames is not None:
+                                utils.debug('Found item <{cyan}%s{reset}> in %s' %(item, self.__host_keys_filepath), 2)
                                 foundItems.append(item)
 
-                        if tmp_keys is not None:
-                            try:
-                                socket.inet_aton(item)
-                                ip = item
-                            except Exception as e:
-                                pass
+                        if hostnames is not None:
+                            for hostname in hostnames:
+                                h = hostname['hostname']
+                                if h in self.__known_hosts:
+                                    if self.__known_hosts[h]['hashed'] and self.__known_hosts[h]['clear_name'] is None:
+                                        hostnameInfo = self.getHostnameInfo(item)
+                                        for key in ['clear_name', 'reachable', 'hostname', 'ip']:
+                                            self.__known_hosts[h][key] = hostnameInfo[key]
 
-                            if ip is None:
-                                if item in resolves:
-                                    utils.debug('Taking <%s> matching IP from previously resolved hostnames' %(item), 3)
-                                    ip = resolves[item]
-                                else:
-                                    try:
-                                        utils.debug('Trying to resolve %s' %(item), 3)
-                                        ip = socket.gethostbyname(item)
-                                        resolves[item] = ip
-                                    except Exception as e:
-                                        utils.debug('{red}Failed to resolve %s!{reset}' %(item), 3)
-
-                            if ip is not None:
-                                if item != ip:
-                                    hostname = item
-
-                            if ip not in foundIps:
-                                foundIps.append(ip)
-                                if self.checkHost(ip, timeout=0.1):
-                                    host['reachable'] = True
-
-                            for keyType in tmp_keys.keys():
-                                tmp_key = tmp_keys[keyType]
-                                fingerPrint = hexlify(tmp_key.get_fingerprint()).decode('utf-8')
-                                keyString = tmp_key.get_base64()
-                                if fingerPrint is not None:
-                                    utils.debug('%s fingerprint: <%s>' %(item, fingerPrint), 3)
-                                    host['key'] = {'finger_print': fingerPrint, 'type': keyType, 'key': tmp_key, 'keystring': keyString}
-                                    if fingerPrint not in self.__known_hosts:
-                                        self.__known_hosts[fingerPrint] = host
-
-                                    if ip not in [d['ip'] for d in self.__known_hosts[fingerPrint]['ips']]:
-                                        ip_dict = {'ip': ip, 'reachable': True, 'hashed': True, 'hash': None}
-                                        hashed = True
-                                        with open(self.__host_keys_filepath, 'r') as f:
-                                            if len(re.findall(r"^%s[ ]+" %(ip), f.read(), re.MULTILINE)) > 0:
-                                                hashed = False
-                                        ip_dict['hashed'] = hashed
-                                        self.__known_hosts[fingerPrint]['ips'].append(ip_dict)
-
-                                    if hostname is not None and hostname not in [d['hostname'] for d in self.__known_hosts[fingerPrint]['hostnames']]:
-                                        hostname_dict = {'hostname': hostname, 'reachable': True, 'hashed': True, 'hash': None}
-                                        hashed = True
-                                        with open(self.__host_keys_filepath, 'r') as f:
-                                            if len(re.findall(r"^%s[ ]+" %(hostname), f.read(), re.MULTILINE)) > 0:
-                                                hashed = False
-                                        hostname_dict['hashed'] = hashed
-                                        self.__known_hosts[fingerPrint]['hostnames'].append(hostname_dict)
-                socket.setdefaulttimeout(oldDefaultTimeout)
                 result = True
 
         return result
@@ -244,33 +191,167 @@ class SSH:
     def loadKnownHosts(self, known_hosts_filepath):
         if os.path.isfile(known_hosts_filepath):
             self.__host_keys_filepath = known_hosts_filepath
-            self.__host_keys = paramiko.hostkeys.HostKeys(known_hosts_filepath)
-            self.__replaced_keys = None
+            try:
+                self.__host_keys = paramiko.hostkeys.HostKeys(known_hosts_filepath)
+            except Exception as e:
+                utils.debug('{red}%s{reset}' %(e))
+                sys.exit(1)
+
+            if self.__host_keys is not None:
+                self.__host_keys_filepath_stats = os.stat(self.__host_keys_filepath)
+
+                if self.__known_hosts is None:
+                    self.__known_hosts = {}
+                    for lineno, hostname in enumerate(self.__host_keys.keys(), 1):
+                        host = {'lineno': lineno, 'name': hostname, 'clear_name': None, 'reachable': False, 'hostname': None, 'ip': None, 'hashed': False, 'key': None, 'replaced_key': None}
+                        host['key'] = self.getHostKeyInfo(self.__host_keys[hostname])
+
+                        hostnameInfo = self.getHostnameInfo(hostname)
+                        for key in ['clear_name', 'reachable', 'hostname', 'ip', 'hashed']:
+                            host[key] = hostnameInfo[key]
+
+                        self.__known_hosts[hostname] = host
+
+    def getHostKeyInfo(self, hostkey):
+        result = None
+
+        key = None
+        keyType = None
+        keyFingerPrint = None
+        keyString = None
+
+        for e in hostkey._entries:
+            if e.valid:
+                key = e.key
+
+                if key is not None:
+                    keyType = key.get_name()
+                    keyString = key.get_base64()
+                    keyFingerPrint = hexlify(key.get_fingerprint()).decode('utf-8')
+                    result = {'key': key, 'key_type': keyType, 'key_string': keyString, 'finger_print': keyFingerPrint}
+
+        return result
+
+    def getHostnameInfo(self, hostname):
+        result = {'name': hostname, 'clear_name': None, 'reachable': False, 'hostname': None, 'ip': None, 'hashed': False}
+
+        if hostname.startswith('|1|'):
+            result['hashed'] = True
+        else:
+            result['clear_name'] = hostname
+
+            oldDefaultTimeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(0.5)
+
+            try:
+                socket.inet_aton(hostname)
+                result['ip'] = hostname
+            except Exception as e:
+                pass
+
+            if result['ip'] is None:
+                result['hostname'] = hostname
+
+                if hostname in self.__resolves:
+                    utils.debug('Taking <{cyan}%s{reset}> matching IP from previously resolved hostnames' %(hostname), 3)
+                    result['ip'] = self.__resolves[hostname]
+                else:
+                    try:
+                        utils.debug('Trying to resolve {cyan}%s{reset}' %(hostname), 3)
+                        #python3 -c "import socket; print(socket.gethostbyname('mipintns1'))"
+                        ip = socket.gethostbyname(hostname)
+                        self.__resolves[hostname] = ip
+                        result['ip'] = ip
+                    except Exception as e:
+                        utils.debug('{red}Failed to resolve {cyan}%s{red}!{reset}' %(hostname), 1)
+
+            if result['ip'] is not None:
+                if self.checkHost(result['ip'], timeout=0.1):
+                    utils.debug('{green}Host IP check ok: <{cyan}%s{green}>{reset}' %(result['ip']), 2)
+                    result['reachable'] = True
+                else:
+                    utils.debug('{red}Host IP check failed: <{cyan}%s{red}>!{reset}' %(result['ip']), 2)
+
+            socket.setdefaulttimeout(oldDefaultTimeout)
+
+        return result
 
     def saveKnownHosts(self, known_hosts_filepath):
         result = False
 
         if self.__host_keys is not None and known_hosts_filepath is not None and known_hosts_filepath != '':
             try:
-                if os.path.isfile(known_hosts_filepath):
-                    os.unlink(known_hosts_filepath)
-                self.__host_keys.save(known_hosts_filepath)
-                if self.__replaced_keys is not None:
-                    replaced_keys_strings = []
-                    for key in self.__replaced_keys:
-                        replaced_keys_strings.append(key.get_base64())
-                    if len(replaced_keys_strings) > 0:
-                        os.rename(known_hosts_filepath, '%s.pre-replaced-keys' %(known_hosts_filepath))
-                        if os.path.isfile('%s.pre-replaced-keys' %(known_hosts_filepath)):
-                            with open('%s.pre-replaced-keys' %(known_hosts_filepath), 'r') as oldfile, open(known_hosts_filepath, 'w') as newfile:
-                                for line in oldfile:
-                                    if not any(old_key in line for old_key in replaced_keys_strings):
-                                        newfile.write(line)
-                            os.unlink('%s.pre-replaced-keys' %(known_hosts_filepath))
-                    self.__replaced_keys = None
-                result = True
+                utils.debug('Replacing known_hosts file: %s' %(known_hosts_filepath), 1)
+                tmp_known_hosts_filepath = '%s.tmp' %(known_hosts_filepath)
+                if os.path.isfile(tmp_known_hosts_filepath):
+                    os.unlink(tmp_known_hosts_filepath)
+                self.__host_keys.save(tmp_known_hosts_filepath)
+                if os.path.isfile(tmp_known_hosts_filepath):
+                    try:
+                        os.chmod(tmp_known_hosts_filepath, self.__host_keys_filepath_stats.st_mode)
+                        os.chown(tmp_known_hosts_filepath, self.__host_keys_filepath_stats.st_uid, self.__host_keys_filepath_stats.st_gid)
+                        if os.path.isfile(known_hosts_filepath):
+                            os.unlink(known_hosts_filepath)
+                        os.rename(tmp_known_hosts_filepath, known_hosts_filepath)
+                        result = True
+                    except Exception as e:
+                        utils.debug('{red}saveKnownHosts: %s{reset}' %(e))
+                    finally:
+                        if os.path.isfile(tmp_known_hosts_filepath):
+                            os.remove(tmp_known_hosts_filepath)
             except Exception as e:
-                pass
+                utils.debug('{red}saveKnownHosts: %s{reset}' %(e), 1)
+
+        return result
+
+    def lookupKnownHosts(self, hostname):
+        result = []
+
+        if self.__host_keys is not None:
+            matches = self.__host_keys.lookup(hostname)
+            if matches is not None:
+                for e in matches._entries:
+                    for h in e.hostnames:
+                        h_dict = {'hostname': h, 'lineno': None}
+                        for lineno, k in enumerate(self.__host_keys.keys(), 1):
+                            if k == h:
+                                h_dict['lineno'] = lineno
+                                break
+                        result.append(h_dict)
+
+        if len(result) == 0:
+            result = None
+
+        return result
+
+    def unhashKnownHosts(self):
+        result = False
+
+        if self.__host_keys is not None and self.__known_hosts is not None:
+            unhashed_host_keys = paramiko.hostkeys.HostKeys()
+
+            for h in self.__host_keys.keys():
+                if h in self.__known_hosts:
+                    host = self.__known_hosts[h]
+
+                    name = host['name']
+                    keyType = None
+                    key = None
+
+                    if host['key'] is not None:
+                        keyType = host['key']['key_type']
+                        key = host['key']['key']
+
+                        if host['clear_name'] is not None:
+                            name = host['clear_name']
+
+                        unhashed_host_keys.add(name, keyType, key)
+
+            if len(unhashed_host_keys) > 0:
+                unhashed_host_keys_filepath = '%s.unhashed' %(self.__host_keys_filepath)
+                utils.debug('Recording a unhashed (as much as possible with found hosts) version of the known_hosts file in %s' %(unhashed_host_keys_filepath), 1)
+                unhashed_host_keys.save(unhashed_host_keys_filepath)
+                result = True
 
         return result
 
@@ -280,61 +361,54 @@ class SSH:
         if self.__host_keys_filepath is None and os.path.isfile(known_hosts_filepath):
             self.loadKnownHosts(known_hosts_filepath)
 
-        if self.__known_hosts is None and os.path.isfile(hosts_filepath):
+        if self.__known_hosts is not None and os.path.isfile(hosts_filepath):
             self.parseHostsFile(hosts_filepath)
 
+        self.unhashKnownHosts()
+
         if self.__host_keys is not None and self.__known_hosts is not None:
+            host_keys_changes = False
+
             if len(self.__known_hosts) > 0:
-                for fingerPrint in self.__known_hosts:
-                    host = self.__known_hosts[fingerPrint]
-                    if host['reachable'] and len(host['ips']) > 0:
-                        main_ip = None
-                        for tmp_ip in host['ips']:
-                            if tmp_ip['reachable']:
-                                main_ip = tmp_ip
-                                break
-                        if main_ip is not None:
-                            try:
-                                self.fakeConnect(main_ip['ip'])
-                            except paramiko.BadHostKeyException as e:
-                                if self.__host_keys_backup_filepath is None:
-                                    self.__host_keys_backup_filepath = '%s.old' %(self.__host_keys_filepath)
-                                    with open(self.__host_keys_filepath, 'r') as oldfile, open(self.__host_keys_backup_filepath, 'w') as newfile:
-                                        for line in oldfile:
-                                            newfile.write(line)
+                for hostname in self.__host_keys.keys():
+                    host = self.__known_hosts[hostname]
 
-                                current_key = e.expected_key
-                                new_key = e.key
-                                utils.debug('bad host key for ip %s (fingerprint %s)!' %(main_ip['ip'], host), 4)
+                    clear_name = None
+                    ip = None
+                    fingerPrint = None
 
-                                utils.debug('Replacing fingerprint <%s>, using the IP <%s> to reach the host' %(fingerPrint, main_ip['ip']), 2)
-                                keyType = new_key.get_name()
-                                newFingerPrint = hexlify(new_key.get_fingerprint()).decode('utf-8')
-                                newKeyString = new_key.get_base64()
-                                for ip in host['ips']:
-                                    utils.debug('Saving new key (type %s) for IP <%s>' %(keyType, ip['ip']), 3)
-                                    add_ip = ip['ip']
-                                    if ip['hashed']:
-                                        if ip['hash'] is None:
-                                            add_ip = paramiko.HostKeys.hash_host(add_ip)
-                                            ip['hash'] = add_ip
-                                    self.__host_keys.add(add_ip, keyType, new_key)
-                                    host_keys_changes = True
-                                for hostname in host['hostnames']:
-                                    utils.debug('Saving new key (type %s) for hostname <%s>' %(keyType, hostname['hostname']), 3)
-                                    add_hostname = hostname['hostname']
-                                    if hostname['hashed']:
-                                        if hostname['hash'] is None:
-                                            add_hostname = paramiko.HostKeys.hash_host(add_hostname)
-                                            hostname['hash'] = add_hostname
-                                    self.__host_keys.add(add_hostname, keyType, new_key)
-                                    host_keys_changes = True
-                                if self.__replaced_keys is None:
-                                    self.__replaced_keys = []
+                    if host['reachable'] and host['ip'] is not None:
+                        clear_name = host['clear_name']
+                        ip = host['ip']
+                        fingerPrint = host['key']['finger_print']
 
-                                self.__replaced_keys.append(current_key)
-                                host['key'] = {'finger_print': newFingerPrint, 'type': keyType, 'key': new_key, 'keystring': newKeyString}
-                                host['replaced_key'] = True
+                    if ip is not None:
+                        try:
+                            self.fakeConnect(clear_name)
+                        except paramiko.BadHostKeyException as e:
+                            if self.__host_keys_backup_filepath is None:
+                                self.__host_keys_backup_filepath = '%s.old' %(self.__host_keys_filepath)
+                                utils.debug('Making known_hosts file backup copy: %s => %s' %(self.__host_keys_filepath, self.__host_keys_backup_filepath), 1)
+                                with open(self.__host_keys_filepath, 'r') as oldfile, open(self.__host_keys_backup_filepath, 'w') as newfile:
+                                    for line in oldfile:
+                                        newfile.write(line)
+
+                            current_key = e.expected_key
+                            newKey = e.key
+                            utils.debug('Bad host key for IP <{cyan}%s{reset}> (fingerprint <{cyan}%s{reset}>)!' %(ip, fingerPrint), 4)
+
+                            utils.debug('    Replacing fingerprint <{cyan}%s{reset}>, using the IP <{cyan}%s{reset}> to reach the host' %(fingerPrint, ip), 2)
+                            self.__known_hosts[hostname]['replaced_key'] = self.__known_hosts[hostname]['key']
+
+                            newKeyType = newKey.get_name()
+                            newFingerPrint = hexlify(newKey.get_fingerprint()).decode('utf-8')
+                            newKeyString = newKey.get_base64()
+
+                            utils.debug('    Saving new key (type {cyan}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, clear_name, ip), 1)
+                            self.__host_keys.add(hostname, newKeyType, newKey)
+                            newKeyInfo = self.getHostKeyInfo(self.__host_keys[hostname])
+                            self.__known_hosts[hostname]['key'] = newKeyInfo
+                            host_keys_changes = True
 
             if host_keys_changes:
                 if self.__host_keys_filepath is not None:
@@ -350,14 +424,14 @@ class SSH:
     def fakeConnect(self, host, port=22, timeout=0.5, banner_timeout=None, auth_timeout=None):
         ssh = paramiko.SSHClient()
         ssh.load_host_keys(self.__host_keys_filepath)
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         try:
+            utils.debug('    Attempting a SSH connection to <{cyan}%s{reset}>' %(host), 5)
             ssh.connect(host, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, look_for_keys=False)
         except paramiko.BadHostKeyException as e:
             raise e
         except Exception as e:
-            print(e)
+            utils.debug('fakeConnect: %s' %(e), 5)
         finally:
             ssh.close()
 
@@ -417,7 +491,7 @@ class SSH:
                     self.__identity = identity
                     result = True
                 except Exception as e:
-                    print('Exception while trying to write SSH Private Key as IOString:', e)
+                    utils.debug('{red}Exception while trying to write SSH Private Key as IOString: %s{reset}' %(e), 1)
 
         return result
 
@@ -435,7 +509,7 @@ class SSH:
                         if 'OPENSSH' in f.readline():
                             tempFilename = ''
                             f.seek(0)
-                            #print('Trying to transform the OpenSSH identity to RSA...')
+                            utils.debug('Trying to transform the OpenSSH identity to RSA...', 5)
                             try:
                                 import tempfile
                                 tempF = tempfile.NamedTemporaryFile(delete=False)
@@ -450,9 +524,9 @@ class SSH:
                                             k = paramiko.RSAKey.from_private_key_file(tempFilename)
                                             result = self.__setIdentityFromFile(tempFilename)
                                         except Exception as exceptConnect:
-                                            print('SSH identity conversion exception:', exceptConnect)
+                                            utils.debug('{red}SSH identity conversion exception: %s{reset}' %(exceptConnect), 1)
                             except Exception as exceptTempFile:
-                                print('SSH identity exception:', exceptTempFile)
+                                utils.debug('{red}SSH identity exception: %s{reset}' %(exceptTempFile), 1)
                             finally:
                                 tempF.close()
                                 if os.path.exists(tempFilename):
@@ -529,7 +603,7 @@ class SSH:
                         if 'PRIVATE KEY' in f.readline():
                             ret = self.addAuthMethod(identity=os.path.join(ssh_keys_dir, filename))
                             if not ret:
-                                print('Failed to add "key" auth method: key <%s>!' %(os.path.join(ssh_keys_dir, filename)))
+                                utils.debug('{red}Failed to add "key" auth method: key <%s>!{reset}' %(os.path.join(ssh_keys_dir, filename)))
 
     def clearIdentity(self):
         self.__identity = None
@@ -575,7 +649,7 @@ class SSH:
                     identity = self.getIdentity()
                     k = paramiko.RSAKey.from_private_key(identity)
                 except Exception as e:
-                    print('Failed to load SSH identity:', e)
+                    utils.debug('{red}Failed to load SSH identity: %s{reset}' %(e), 1)
 
             ssh = paramiko.SSHClient()
             if filename is not None and os.path.isfile(filename):
@@ -591,7 +665,7 @@ class SSH:
                             self.__user = user
                             self.__password = password
             except Exception as e:
-                #print('Failed to connect to <%s> with user <%s>:' %(host, user), '<<<%s>>>' %(e), type(e))
+                utils.debug('{red}Failed to connect to <%s> with user <%s>: <<<%s>>>, type: %s{reset}' %(host, user, e, type(e)), 5)
                 pass
 
         return self.isConnected()
@@ -618,17 +692,17 @@ class SSH:
                             try:
                                 connected = self.connect(host, method['username'], method['password'], port=port, timeout=timeout)
                             except Exception as e:
-                                print(e)
+                                utils.debug('{red}%s{reset}' %(e), 1)
                         elif method['method'] == 'key':
                             try:
                                 identity = method['identity']
                                 identity.seek(0)
                                 ret = self.setIdentity(identity)
                                 if not ret:
-                                    print('FAILED TO SET IDENTITY %s' %(method['identityFilename']))
+                                    utils.debug('{red}FAILED TO SET IDENTITY %s{reset}' %(method['identityFilename']))
                                 connected = self.connect(host, method['username'], port=port, timeout=timeout)
                             except Exception as e:
-                                print(e)
+                                utils.debug('{red}%s{reset}' %(e))
 
                         if not connected:
                             tries -= 1
@@ -640,7 +714,7 @@ class SSH:
                         break
                     else:
                         self.__failed_auth_methods.append(method)
-                        #print('failed to connect to %s using user <%s> (key <%s>) with method <%s>' %(host, method['username'], method['identityFilename'], method['method']))
+                        utils.debug('{red}failed to connect to %s using user <%s> (key <%s>) with method <%s>{reset}' %(host, method['username'], method['identityFilename'], method['method']))
                         time.sleep(0.1)
         else:
             raise HostUnreachable('The TCP port <%s> is not open on host <%s>!' %(port, host))
