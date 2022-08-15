@@ -3,8 +3,11 @@
 import os
 import sys
 import argparse
+import getpass
+import platform
 import paramiko
 from paramiko import SFTPClient
+import base64
 import socket
 from binascii import hexlify
 import re
@@ -136,6 +139,7 @@ class SSH:
     __identity = None
     __password = None
     __conn = None
+    __jump_hosts = None
     __resolves = {}
     __known_hosts = None
     __host_keys_filepath = None
@@ -143,7 +147,6 @@ class SSH:
     __host_keys_backup_filepath = None
     __host_keys = None
     __host_list_filepath = None
-    __replaced_keys = None
 
     def __init__(self):
         pass
@@ -169,7 +172,7 @@ class SSH:
                             break
 
                         if item not in foundItems:
-                            utils.debug('Searching for %s in %s' %(item, self.__host_keys_filepath), 4)
+                            utils.debug('Searching for %s in %s' %(item, self.__host_keys_filepath), 5)
                             hostnames = self.lookupKnownHosts(item)
                             if hostnames is not None:
                                 utils.debug('Found item <{cyan}%s{reset}> in %s' %(item, self.__host_keys_filepath), 2)
@@ -203,11 +206,11 @@ class SSH:
                 if self.__known_hosts is None:
                     self.__known_hosts = {}
                     for lineno, hostname in enumerate(self.__host_keys.keys(), 1):
-                        host = {'lineno': lineno, 'name': hostname, 'clear_name': None, 'reachable': False, 'hostname': None, 'ip': None, 'hashed': False, 'key': None, 'replaced_key': None}
+                        host = {'lineno': lineno, 'name': hostname, 'clear_name': None, 'reachable': False, 'jump_host': None, 'hostname': None, 'ip': None, 'port': None, 'hashed': False, 'key': None, 'replaced_key': None}
                         host['key'] = self.getHostKeyInfo(self.__host_keys[hostname])
 
                         hostnameInfo = self.getHostnameInfo(hostname)
-                        for key in ['clear_name', 'reachable', 'hostname', 'ip', 'hashed']:
+                        for key in ['clear_name', 'reachable', 'hostname', 'ip', 'port', 'hashed']:
                             host[key] = hostnameInfo[key]
 
                         self.__known_hosts[hostname] = host
@@ -232,16 +235,79 @@ class SSH:
 
         return result
 
-    def getHostnameInfo(self, hostname):
-        result = {'name': hostname, 'clear_name': None, 'reachable': False, 'hostname': None, 'ip': None, 'hashed': False}
+    def resolveHostname(self, hostname, jump_host=None):
+        result = None
 
-        if hostname.startswith('|1|'):
+        oldDefaultTimeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(0.5)
+
+        try:
+            socket.inet_aton(hostname)
+            result = hostname
+        except Exception as e:
+            pass
+
+        if result is None:
+            if hostname in self.__resolves:
+                utils.debug('Taking <{cyan}%s{reset}> matching IP from previously resolved hostnames' %(hostname), 3)
+                result = self.__resolves[hostname]
+            else:
+                try:
+                    if jump_host is not None:
+                        cmd = """
+import socket
+print(socket.gethostbyname('%s'))
+""" %(hostname)
+
+                        utils.debug('Trying to resolve {cyan}%s{reset} from jump host <{cyan}%s@%s:%s{reset}>' %(hostname, jump_host['user'], jump_host['host'], jump_host['port']), 3)
+                        res = self.jumpExec(cmd, jump_host)
+                        if res is not None:
+                            for line in res:
+                                line = line.strip()
+                                try:
+                                    socket.inet_aton(line)
+                                    result = line
+                                except Exception as e:
+                                    pass
+                                if result is not None:
+                                    utils.debug('result: <%s>' %(result), 3)
+                                    break
+                    else:
+                        utils.debug('Trying to resolve {cyan}%s{reset}' %(hostname), 3)
+                        ip = socket.gethostbyname(hostname)
+                        result = ip
+                except Exception as e:
+                    utils.debug('{red}Failed to resolve {cyan}%s{red}!{reset}' %(hostname), 1)
+
+        if result is not None and hostname not in self.__resolves:
+            self.__resolves[hostname] = result
+
+        socket.setdefaulttimeout(oldDefaultTimeout)
+
+        return result
+
+    def getHostnameInfo(self, hostname, port=None, jump_host=None):
+        if hostname is not None:
+            hostname = hostname.strip()
+
+        result = {'name': hostname, 'clear_name': None, 'reachable': False, 'jump_host': None, 'hostname': None, 'ip': None, 'port': port, 'hashed': False}
+
+        if hostname is None or hostname == '':
+            return result
+        elif hostname.startswith('|1|'):
             result['hashed'] = True
         else:
-            result['clear_name'] = hostname
+            clear_name = hostname
+            if ':' in clear_name:
+                clear_name = clear_name.split(':')
+                if len(clear_name) > 1 and clear_name[1] != '' and clear_name[1].isnumeric() and port is None:
+                    port = int(clear_name[1])
+                hostname = clear_name[0]
+            if port is None:
+                port = 22
 
-            oldDefaultTimeout = socket.getdefaulttimeout()
-            socket.setdefaulttimeout(0.5)
+            result['clear_name'] = clear_name
+            result['port'] = port
 
             try:
                 socket.inet_aton(hostname)
@@ -251,28 +317,18 @@ class SSH:
 
             if result['ip'] is None:
                 result['hostname'] = hostname
-
-                if hostname in self.__resolves:
-                    utils.debug('Taking <{cyan}%s{reset}> matching IP from previously resolved hostnames' %(hostname), 3)
-                    result['ip'] = self.__resolves[hostname]
-                else:
-                    try:
-                        utils.debug('Trying to resolve {cyan}%s{reset}' %(hostname), 3)
-                        #python3 -c "import socket; print(socket.gethostbyname('mipintns1'))"
-                        ip = socket.gethostbyname(hostname)
-                        self.__resolves[hostname] = ip
-                        result['ip'] = ip
-                    except Exception as e:
-                        utils.debug('{red}Failed to resolve {cyan}%s{red}!{reset}' %(hostname), 1)
+                ip = self.resolveHostname(hostname, jump_host)
+                if ip is not None:
+                    result['ip'] = ip
+                    if jump_host is not None:
+                        result['jump_host'] = jump_host
 
             if result['ip'] is not None:
-                if self.checkHost(result['ip'], timeout=0.1):
+                if self.checkHost(result['ip'], port=port, timeout=0.1, jump_host=jump_host):
                     utils.debug('{green}Host IP check ok: <{cyan}%s{green}>{reset}' %(result['ip']), 2)
                     result['reachable'] = True
                 else:
                     utils.debug('{red}Host IP check failed: <{cyan}%s{red}>!{reset}' %(result['ip']), 2)
-
-            socket.setdefaulttimeout(oldDefaultTimeout)
 
         return result
 
@@ -289,7 +345,8 @@ class SSH:
                 if os.path.isfile(tmp_known_hosts_filepath):
                     try:
                         os.chmod(tmp_known_hosts_filepath, self.__host_keys_filepath_stats.st_mode)
-                        os.chown(tmp_known_hosts_filepath, self.__host_keys_filepath_stats.st_uid, self.__host_keys_filepath_stats.st_gid)
+                        if platform.system() != 'Windows':
+                            os.chown(tmp_known_hosts_filepath, self.__host_keys_filepath_stats.st_uid, self.__host_keys_filepath_stats.st_gid)
                         if os.path.isfile(known_hosts_filepath):
                             os.unlink(known_hosts_filepath)
                         os.rename(tmp_known_hosts_filepath, known_hosts_filepath)
@@ -355,36 +412,215 @@ class SSH:
 
         return result
 
+    def listJumpHosts(self):
+        result = ''
+
+        if self.__jump_hosts is not None and len(self.__jump_hosts) > 0:
+            for jump_host in self.__jump_hosts:
+                if result != '':
+                    result += '\n'
+                result += '{magenta}%s{reset}: {cyan}%s@%s:%s{reset}' %(jump_host['jump_host_idx'] + 1, jump_host['user'], jump_host['host'], jump_host['port'])
+                if jump_host['linked_jump_host_idx'] is not None:
+                    linked_idx = jump_host['linked_jump_host_idx']
+                    result += ' (linked to {magenta}%s{reset}: {cyan}%s@%s:%s{reset})' %(self.__jump_hosts[linked_idx]['jump_host_idx'] + 1, self.__jump_hosts[linked_idx]['user'], self.__jump_hosts[linked_idx]['host'], self.__jump_hosts[linked_idx]['port'])
+        return result
+
+    def createJumpHost(self, linked_jump_host=None):
+        jump_host = None
+
+        go_ahead = True
+
+        sys.stdout.write('Hostname (:port)? ')
+        host = input().lower()
+        port = 22
+        if ':' in host:
+            host = host.split(':')
+            if len(host) > 1 and host[1] != '22':
+                port = int(host[1])
+                host = host[0]
+            hostInfos = self.getHostnameInfo(host, port, linked_jump_host)
+            if hostInfos['ip'] is None:
+                utils.debug('{red}The hostname <{cyan}%s{red}> is not resolvable!{reset}' %(host))
+                go_ahead = False
+            if go_ahead and not hostInfos['reachable']:
+                utils.debug('{red}The hostname <{cyan}%s{red}> is not reachable!{reset}' %(host))
+                go_ahead = False
+
+        if go_ahead:
+            sys.stdout.write('User: ')
+            user = input()
+            if user == '':
+                utils.debug('{red}User name cannot be empty!{reset}')
+                go_ahead = False
+
+        if go_ahead:
+            password = getpass.getpass(prompt='Password: ')
+            if password == '':
+                utils.debug('{red}Password cannot be empty!{reset}')
+                go_ahead = False
+
+        if go_ahead:
+            jump_host = self.connectJump(host, user, password=password, port=port, jump_host=linked_jump_host)
+            if jump_host is not None:
+                utils.debug('{green}Successfully connected to {cyan}%s@%s:%s{reset}' %(jump_host['user'], jump_host['host'], jump_host['port']), 2)
+            else:
+                go_ahead = False
+
+        return jump_host
+
+    def autoCheckJumpHosts(self, target_host):
+        jump_host = None
+
+        hostInfos = None
+        if target_host is not None:
+            hostInfos = self.getHostnameInfo(target_host['clear_name'], target_host['port'])
+            if not hostInfos['reachable'] and self.__jump_hosts is not None and len(self.__jump_hosts) > 0:
+                for jump_host in self.__jump_hosts:
+                    hostInfos = self.getHostnameInfo(target_host['clear_name'], target_host['port'], jump_host)
+                    if hostInfos['reachable']:
+                        break
+
+            if not hostInfos['reachable']:
+                jump_host = None
+
+        return jump_host
+
+    def configureJumpHosts(self, target_host=None):
+        jump_host = None
+
+        exit = False
+        hostInfos = None
+        if target_host is not None:
+            hostInfos = self.getHostnameInfo(target_host['clear_name'], target_host['port'])
+            if hostInfos['reachable']:
+                exit = True
+            else:
+                tmp_jump_host = self.autoCheckJumpHosts(target_host)
+                if tmp_jump_host is not None:
+                    jump_host = tmp_jump_host
+                    exit = True
+
+        linked_jump_host = None
+        go_ahead = True
+        while not exit:
+            host = None
+            port = 22
+            user = None
+            password = None
+
+            if go_ahead and not exit and linked_jump_host is None and jump_host is None:
+                if self.__jump_hosts is not None and len(self.__jump_hosts) > 0:
+                    sys.stdout.write('Do you want to use an existing pre-configured jump host [Y/n]? ')
+                    response = input().lower()
+                    if response != 'n':
+                        jump_hosts_list_str = self.listJumpHosts()
+                        if jump_hosts_list_str is not None:
+                            utils.print(jump_hosts_list_str)
+                        sys.stdout.write('Please enter the index number matching the pre-configured jump host you would like to use: ')
+                        response = input()
+                        if response.isnumeric():
+                            response = int(response)
+                            if response >= 1 and response <= len(self.__jump_hosts):
+                                jump_host = self.__jump_hosts[response - 1]
+                                if jump_host['linked_jump_host_idx'] is not None:
+                                    linked_jump_host = self.__jump_hosts[jump_host['linked_jump_host_idx']]
+                                if target_host is not None:
+                                    hostInfos = self.getHostnameInfo(target_host['clear_name'], target_host['port'], jump_host)
+                                    if hostInfos['reachable']:
+                                        exit = True
+                            else:
+                                utils.debug('{red}Invalid choice!{reset}')
+                                go_ahead = False
+                        else:
+                            utils.debug('{red}Invalid choice!{reset}')
+                            go_ahead = False
+
+            if go_ahead and not exit and jump_host is not None:
+                if target_host is not None and not hostInfos['reachable']:
+                    sys.stdout.write('The active jump host <%s@%s:%s> does not seem to be able to reach the targetted host <%s:%s>! Do you want to setup an additional jump host linked to the current one [Y/n]? ' %(jump_host['user'], jump_host['host'], jump_host['port'], target_host['clear_name'], target_host['port']))
+                    response = input().lower()
+                    if response == 'n':
+                        jump_host = None
+                        linked_jump_host = None
+                        exit = True
+                else:
+                    sys.stdout.write('You can directly use this jump host (if you enter "n"), or create a new connection chain-linked (depending) to this one. Do you want to create a new connection [y/N]? ')
+                    response = input().lower()
+                    if response != 'y':
+                        exit = True
+
+            if go_ahead and not exit:
+                tmp_jump_host = self.createJumpHost(jump_host)
+                if tmp_jump_host is not None:
+                    jump_host = tmp_jump_host
+                    if jump_host['linked_jump_host_idx'] is not None:
+                        linked_jump_host = self.__jump_hosts[jump_host['linked_jump_host_idx']]
+                    if target_host is not None:
+                        hostInfos = self.getHostnameInfo(target_host['clear_name'], target_host['port'], jump_host)
+                        if hostInfos['reachable']:
+                            exit = True
+
+            if go_ahead and exit:
+                if target_host is not None and not hostInfos['reachable']:
+                    sys.stdout.write('Your current jump host configuration cannot reach the targetted host! Do you want to run the setup again [Y/n]? ')
+                    response = input().lower()
+                    if response != 'n':
+                        exit = False
+
+            if not go_ahead and not exit:
+                sys.stdout.write('Failed to configure the jump host! Continue the jump hosts setup [Y/n]? ')
+                response = input().lower()
+                if response == 'n':
+                    exit = True
+
+        return jump_host
+
     def autoSyncKnownHosts(self, known_hosts_filepath=None, hosts_filepath=None):
         result = False
 
         if self.__host_keys_filepath is None and os.path.isfile(known_hosts_filepath):
+            utils.debug('Loading {cyan}%s{reset}, and checking the networking details and connectivity of every clear hostname host. This may take a while...' %(known_hosts_filepath))
             self.loadKnownHosts(known_hosts_filepath)
 
         if self.__known_hosts is not None and os.path.isfile(hosts_filepath):
+            utils.debug('Parsing hosts list file {cyan}%s{reset}, and checking the networking details and connectivity of every host which appears in {cyan}%s{reset}. This may take a while...' %(hosts_filepath, known_hosts_filepath))
             self.parseHostsFile(hosts_filepath)
 
-        self.unhashKnownHosts()
-
         if self.__host_keys is not None and self.__known_hosts is not None:
+            utils.debug('Checking server keys...')
             host_keys_changes = False
 
             if len(self.__known_hosts) > 0:
-                for hostname in self.__host_keys.keys():
-                    host = self.__known_hosts[hostname]
+                for key_name in self.__host_keys.keys():
+                    host = self.__known_hosts[key_name]
 
-                    clear_name = None
-                    ip = None
+                    jump_host = None
                     fingerPrint = None
 
-                    if host['reachable'] and host['ip'] is not None:
-                        clear_name = host['clear_name']
-                        ip = host['ip']
+                    if host['key'] is not None:
                         fingerPrint = host['key']['finger_print']
 
-                    if ip is not None:
+                    if host['clear_name'] is not None and not host['reachable']:
+                        tmp_jump_host = self.autoCheckJumpHosts(host)
+                        if tmp_jump_host is not None:
+                            jump_host = tmp_jump_host
+                        else:
+                            sys.stdout.write('The host <%s> is not (directly) reachable. Do you have access to a jump host that you want to configure here [y/N]? ' %(host['clear_name']))
+                            response = input().lower()
+                            if response == 'y':
+                                try:
+                                    jump_host = self.configureJumpHosts(host)
+                                except Exception as e:
+                                    pass
+
+                        if jump_host is not None:
+                            hostInfo = self.getHostnameInfo(host['clear_name'], host['port'], jump_host)
+                            for key in 'reachable', 'hostname', 'ip', 'jump_host':
+                                host[key] = hostInfo[key]
+
+                    if host['ip'] is not None and host['reachable']:
                         try:
-                            self.fakeConnect(clear_name)
+                            self.fakeConnect(host['clear_name'], port=host['port'], jump_host=jump_host)
                         except paramiko.BadHostKeyException as e:
                             if self.__host_keys_backup_filepath is None:
                                 self.__host_keys_backup_filepath = '%s.old' %(self.__host_keys_filepath)
@@ -395,24 +631,25 @@ class SSH:
 
                             current_key = e.expected_key
                             newKey = e.key
-                            utils.debug('Bad host key for IP <{cyan}%s{reset}> (fingerprint <{cyan}%s{reset}>)!' %(ip, fingerPrint), 4)
+                            utils.debug('Bad host key for IP <{cyan}%s{reset}> (fingerprint <{cyan}%s{reset}>)!' %(host['ip'], fingerPrint), 4)
 
-                            utils.debug('    Replacing fingerprint <{cyan}%s{reset}>, using the IP <{cyan}%s{reset}> to reach the host' %(fingerPrint, ip), 2)
-                            self.__known_hosts[hostname]['replaced_key'] = self.__known_hosts[hostname]['key']
+                            utils.debug('    Replacing fingerprint <{cyan}%s{reset}>, using the IP <{cyan}%s{reset}> to reach the host' %(fingerPrint, host['ip']), 2)
+                            self.__known_hosts[key_name]['replaced_key'] = self.__known_hosts[key_name]['key']
 
                             newKeyType = newKey.get_name()
                             newFingerPrint = hexlify(newKey.get_fingerprint()).decode('utf-8')
                             newKeyString = newKey.get_base64()
 
-                            utils.debug('    Saving new key (type {cyan}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, clear_name, ip), 1)
-                            self.__host_keys.add(hostname, newKeyType, newKey)
-                            newKeyInfo = self.getHostKeyInfo(self.__host_keys[hostname])
-                            self.__known_hosts[hostname]['key'] = newKeyInfo
+                            utils.debug('    Saving new key (type {cyan}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, host['clear_name'], host['ip']), 1)
+                            self.__host_keys.add(key_name, newKeyType, newKey)
+                            newKeyInfo = self.getHostKeyInfo(self.__host_keys[key_name])
+                            self.__known_hosts[key_name]['key'] = newKeyInfo
                             host_keys_changes = True
 
             if host_keys_changes:
                 if self.__host_keys_filepath is not None:
-                    result = self.saveKnownHosts(self.__host_keys_filepath)
+                    #result = self.saveKnownHosts(self.__host_keys_filepath)
+                    result = True
                     if result:
                         self.__host_keys = None
                         self.loadKnownHosts(self.__host_keys_filepath)
@@ -421,43 +658,55 @@ class SSH:
 
         return result
 
-    def fakeConnect(self, host, port=22, timeout=0.5, banner_timeout=None, auth_timeout=None):
-        ssh = paramiko.SSHClient()
-        ssh.load_host_keys(self.__host_keys_filepath)
-
-        try:
-            utils.debug('    Attempting a SSH connection to <{cyan}%s{reset}>' %(host), 5)
-            ssh.connect(host, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, look_for_keys=False)
-        except paramiko.BadHostKeyException as e:
-            raise e
-        except Exception as e:
-            utils.debug('fakeConnect: %s' %(e), 5)
-        finally:
-            ssh.close()
-
-    def isPortOpen(self, ip, port=22, timeout=2):
-        import socket
-
+    def isPortOpen(self, ip, port=22, timeout=2, jump_host=None):
         isOpen = False
 
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        try:
-            s.connect((ip, int(port)))
-            s.shutdown(socket.SHUT_RDWR)
-            isOpen = True
-        except:
-            pass
-        finally:
-            s.close()
+
+        if jump_host is not None:
+            code = """
+import socket
+isOpen = False
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(%s)
+try:
+    s.connect(('%s', %s))
+    s.shutdown(socket.SHUT_RDWR)
+    isOpen = True
+except:
+    pass
+finally:
+    s.close()
+print(isOpen)
+""" %(timeout, ip, port)
+
+            utils.debug('Checking if <%s:%s> is reachable from jump host <%s@%s:%s>' %(ip, port, jump_host['user'], jump_host['host'], jump_host['port']), 2)
+            res = self.jumpExec(code, jump_host)
+            if res is not None:
+                for line in res:
+                    line = line.strip()
+                    utils.debug('result: <%s>' %(line), 2)
+                    if line == 'True':
+                        isOpen = True
+                        break
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.connect((ip, int(port)))
+                s.shutdown(socket.SHUT_RDWR)
+                isOpen = True
+            except:
+                pass
+            finally:
+                s.close()
 
         return isOpen
 
-    def checkHost(self, host, port=22, timeout=2, retries=3, delay=0.1):
+    def checkHost(self, host, port=22, timeout=2, retries=3, delay=0.1, jump_host=None):
         isUp = False
 
         for i in range(retries):
-            if self.isPortOpen(host, port=port, timeout=timeout):
+            if self.isPortOpen(host, port=port, timeout=timeout, jump_host=jump_host):
                 isUp = True
                 break
             else:
@@ -637,7 +886,7 @@ class SSH:
     def getAuthMethod(self):
         return self.__auth_method
 
-    def connect(self, host, user, password=None, port=22, timeout=2, banner_timeout=200, auth_timeout=200, filename=None):
+    def connect(self, host, user, password=None, port=22, timeout=2, banner_timeout=200, auth_timeout=200, filename=None, sock=None):
         if host is not None and host != '' and user is not None and user != '':
             import paramiko
             import logging
@@ -656,8 +905,8 @@ class SSH:
                 ssh.load_system_host_keys(filename)
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             try:
-                if self.checkHost(host, port=port, timeout=timeout):
-                    ssh.connect(host, port=port, username=user, password=password, pkey=k, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout)
+                if sock is not None or self.checkHost(host, port=port, timeout=timeout):
+                    ssh.connect(host, port=port, username=user, password=password, pkey=k, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, sock=sock)
                     if ssh.get_transport() is not None:
                         if ssh.get_transport().is_active():
                             self.__conn = ssh
@@ -665,10 +914,130 @@ class SSH:
                             self.__user = user
                             self.__password = password
             except Exception as e:
-                utils.debug('{red}Failed to connect to <%s> with user <%s>: <<<%s>>>, type: %s{reset}' %(host, user, e, type(e)), 5)
-                pass
+                utils.debug('{red}Failed to connect to <%s> with user <%s>: <<<%s>>>, type: %s{reset}' %(host, user, e, type(e)), 4)
 
         return self.isConnected()
+
+    def createTransportChannelFromJumpHost(self, jump_host, target_host, target_port):
+        result = None
+
+        if jump_host is not None and target_host is not None:
+            utils.debug('Attempting to prepare a transport channel from the jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port']), 4)
+
+            jump_conn = None
+            jump_transport = None
+            jump_src_addr = None
+            jump_dst_addr = None
+            jump_channel = None
+
+            jump_conn = jump_host['conn']
+            if jump_conn is not None:
+                try:
+                    jump_transport = jump_conn.get_transport()
+                    jump_src_addr = (jump_host['host'], jump_host['port'])
+                    jump_dst_addr = (target_host, target_port)
+                    jump_channel = jump_transport.open_channel('direct-tcpip', jump_dst_addr, jump_src_addr)
+                    result = jump_channel
+                    utils.debug('{green}Transport channel ready{reset}', 4)
+                except Exception as e:
+                    utils.debug('{red}Failed to prepare transport channel: %s{reset}' %(e))
+
+        return result
+
+    def fakeConnect(self, host, port=22, timeout=0.5, banner_timeout=None, auth_timeout=None, jump_host=None):
+        result = False
+
+        ssh = paramiko.SSHClient()
+        ssh.load_host_keys(self.__host_keys_filepath)
+
+        sock = None
+        if jump_host is not None:
+            sock = self.createTransportChannelFromJumpHost(jump_host, host, port)
+            if sock is None:
+                jump_host = None
+                return result
+
+        try:
+            msg = 'fakeConnect: Checking the server key for <{cyan}%s:%s{reset}>' %(host, port)
+            if jump_host is not None:
+                msg += ', using jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
+            utils.debug(msg, 4)
+            ssh.connect(host, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, look_for_keys=False, sock=sock)
+            result = True
+        except paramiko.BadHostKeyException as e:
+            raise e
+        except Exception as e:
+            utils.debug('{red}fakeConnect: %s{reset}' %(e), 4)
+        finally:
+            ssh.close()
+
+        return result
+
+    def connectJump(self, host, user, password=None, port=22, timeout=2, banner_timeout=200, auth_timeout=200, filename=None, jump_host=None):
+        result = None
+
+        linked_jump_host_idx = None
+        sock = None
+
+        if self.__jump_hosts is not None and len(self.__jump_hosts) > 0:
+            if '%s@%s:%s' %(user, host, port) in ['%s@%s:%s' %(d['user'], d['host'], d['port']) for d in self.__jump_hosts]:
+                utils.debug('{red}connectJump: The combination <{cyan}%s@%s:%s{red}> already exist in the jump hosts!{reset}' %(user, host, port))
+                return result
+
+        if jump_host is not None:
+            linked_jump_host_idx = jump_host['jump_host_idx']
+
+            jump_channel = self.createTransportChannelFromJumpHost(jump_host, host, port)
+            if jump_channel is not None:
+                sock = jump_channel
+            else:
+                jump_host = None
+                linked_jump_host_idx = None
+
+            if sock is None:
+                return result
+
+        msg = 'Trying to connect <{cyan}%s@%s:%s{reset}>' %(user, host, port)
+        if sock is not None:
+            msg += ', using a transport channel prepared from jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
+        utils.debug(msg, 2)
+        res = self.connect(host, user, password=password, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, filename=filename, sock=sock)
+        if res:
+            utils.debug('{green}Connection successful{reset}', 4)
+            if self.__jump_hosts is None:
+                self.__jump_hosts = []
+            new_jump_host = {'conn': self.__conn, 'jump_host_idx': len(self.__jump_hosts), 'linked_jump_host_idx': linked_jump_host_idx, 'host': self.__host, 'port': port, 'user': self.__user, 'password': self.__password}
+            self.__jump_hosts.append(new_jump_host)
+            self.__conn = None
+            self.isConnected()
+
+            result = new_jump_host
+        else:
+            utils.debug('{red}Connection failed!{reset}', 2)
+
+        return result
+
+    def jumpExec(self, code, jump_host):
+        result = None
+
+        if jump_host is not None:
+            codeEncodedString = base64.b64encode(code.encode()).decode()
+
+            cmd = "python3 -c \"import base64; exec(base64.b64decode('%s').decode())\"" %(codeEncodedString)
+            try:
+                utils.debug('Executing code on jump host <%s@%s:%s>' %(jump_host['user'], jump_host['host'], jump_host['port']), 3)
+                stdin, stdout, stderr = jump_host['conn'].exec_command(cmd)
+                if stderr.read() == b'':
+                    result = stdout.readlines()
+                if proc.stderr != '':
+                    utils.debug('{red}jumpExec: Error when executing the requested code: %s{reset}' %(proc.stderr))
+                    raise Exception(proc.stderr)
+
+                result = proc.stdout.strip()
+            except Exception as e:
+                pass
+
+        return result
 
     def tryAuthMethods(self, host, port=22, skipMethods=None, timeout=2):
         connected = False
