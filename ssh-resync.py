@@ -161,7 +161,7 @@ class SSH:
             host_keys_changes = False
 
             with open(hosts_filepath, 'r') as f:
-                utils.debug('Parsing hosts list file: %s' %(hosts_filepath), 1)
+                utils.debug('Parsing hosts list file: %s' %(hosts_filepath), 2)
                 for line in f.readlines():
                     fields = line.split()
                     for i in range(0, len(fields)):
@@ -277,7 +277,7 @@ print(socket.gethostbyname('%s'))
                         ip = socket.gethostbyname(hostname)
                         result = ip
                 except Exception as e:
-                    utils.debug('{red}Failed to resolve {cyan}%s{red}!{reset}' %(hostname), 1)
+                    utils.debug('{red}Failed to resolve {cyan}%s{red}!{reset}' %(hostname), 2)
 
         if result is not None and hostname not in self.__resolves:
             self.__resolves[hostname] = result
@@ -296,6 +296,8 @@ print(socket.gethostbyname('%s'))
             return result
         elif hostname.startswith('|1|'):
             result['hashed'] = True
+            if port is None:
+                result['port'] = 22
         else:
             clear_name = hostname
             if ':' in clear_name:
@@ -425,12 +427,38 @@ print(socket.gethostbyname('%s'))
                     result += ' (linked to {magenta}%s{reset}: {cyan}%s@%s:%s{reset})' %(self.__jump_hosts[linked_idx]['jump_host_idx'] + 1, self.__jump_hosts[linked_idx]['user'], self.__jump_hosts[linked_idx]['host'], self.__jump_hosts[linked_idx]['port'])
         return result
 
+    def getLinkedJumpHosts(self, jump_host):
+        result = []
+
+        if jump_host is not None and self.__jump_hosts is not None:
+            result.append(jump_host)
+            if jump_host['linked_jump_host_idx'] is not None:
+                tmp_result = self.getLinkedJumpHosts(self.__jump_hosts[jump_host['linked_jump_host_idx']])
+                for tmp_jump_host in tmp_result:
+                    result.append(tmp_jump_host)
+
+        return result
+
+    def getJumpHostsStr(self, jump_host):
+        result = ''
+
+        if jump_host is not None:
+            jump_host_list = self.getLinkedJumpHosts(jump_host)
+            if isinstance(jump_host_list, list) and len(jump_host_list) > 0:
+                jump_host_list.reverse()
+                for tmp_jump_host in jump_host_list:
+                    if result != '':
+                        result += ' => '
+                    result += '{magenta}%s@%s:%s{reset}' %(tmp_jump_host['user'], tmp_jump_host['host'], tmp_jump_host['port'])
+
+        return result
+
     def createJumpHost(self, linked_jump_host=None):
         jump_host = None
 
         go_ahead = True
 
-        sys.stdout.write('Hostname (:port)? ')
+        sys.stdout.write('New Jump Host Hostname (:port)? ')
         host = input().lower()
         port = 22
         if ':' in host:
@@ -438,13 +466,13 @@ print(socket.gethostbyname('%s'))
             if len(host) > 1 and host[1] != '22':
                 port = int(host[1])
                 host = host[0]
-            hostInfos = self.getHostnameInfo(host, port, linked_jump_host)
-            if hostInfos['ip'] is None:
-                utils.debug('{red}The hostname <{cyan}%s{red}> is not resolvable!{reset}' %(host))
-                go_ahead = False
-            if go_ahead and not hostInfos['reachable']:
-                utils.debug('{red}The hostname <{cyan}%s{red}> is not reachable!{reset}' %(host))
-                go_ahead = False
+        hostInfos = self.getHostnameInfo(host, port, linked_jump_host)
+        if hostInfos['ip'] is None:
+            utils.debug('{red}The hostname <{cyan}%s{red}> is not resolvable!{reset}' %(host))
+            go_ahead = False
+        if go_ahead and not hostInfos['reachable']:
+            utils.debug('{red}The hostname <{cyan}%s{red}> is not reachable!{reset}' %(host))
+            go_ahead = False
 
         if go_ahead:
             sys.stdout.write('User: ')
@@ -575,12 +603,37 @@ print(socket.gethostbyname('%s'))
 
         return jump_host
 
-    def autoSyncKnownHosts(self, known_hosts_filepath=None, hosts_filepath=None):
+    def autoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None):
         result = False
 
         if self.__host_keys_filepath is None and os.path.isfile(known_hosts_filepath):
-            utils.debug('Loading {cyan}%s{reset}, and checking the networking details and connectivity of every clear hostname host. This may take a while...' %(known_hosts_filepath))
+            utils.debug('Loading {cyan}%s{reset}, and checking the networking details and connectivity of every clear hostname host. This may take a while (if hostnames are not hashed)...' %(known_hosts_filepath))
             self.loadKnownHosts(known_hosts_filepath)
+            if self.__known_hosts is not None:
+                nb_known_hosts = len(self.__known_hosts)
+                nb_hashed_known_hosts = 0
+                nb_unhashed_known_hosts = 0
+                nb_unresolvable_known_hosts = 0
+                nb_reachable_known_hosts = 0
+                nb_unreachable_known_hosts = 0
+                for host_name in self.__known_hosts:
+                    tmp_host = self.__known_hosts[host_name]
+                    if tmp_host['hashed']:
+                        nb_hashed_known_hosts += 1
+                    else:
+                        nb_unhashed_known_hosts += 1
+                        if tmp_host['ip'] is None:
+                            nb_unresolvable_known_hosts += 1
+                        if tmp_host['reachable']:
+                            nb_reachable_known_hosts += 1
+                        else:
+                            nb_unreachable_known_hosts += 1
+                utils.debug('''  Total hosts: {magenta}%s{reset}
+    Hashed names: {magenta}%s{reset} (we will need the host list file to find hosts behind their hash!)
+    Unhashed (clear) names: {magenta}%s{reset}:
+        Reachable: {magenta}%s{reset}
+        Unreachable (will require jump hosts): {magenta}%s{reset}:
+            Unresolvable (no DNS match): {magenta}%s{reset}''' %(nb_known_hosts, nb_hashed_known_hosts, nb_unhashed_known_hosts, nb_reachable_known_hosts, nb_unreachable_known_hosts, nb_unresolvable_known_hosts), timestamp=False)
 
         if self.__known_hosts is not None and os.path.isfile(hosts_filepath):
             utils.debug('Parsing hosts list file {cyan}%s{reset}, and checking the networking details and connectivity of every host which appears in {cyan}%s{reset}. This may take a while...' %(hosts_filepath, known_hosts_filepath))
@@ -615,7 +668,7 @@ print(socket.gethostbyname('%s'))
 
                         if jump_host is not None:
                             hostInfo = self.getHostnameInfo(host['clear_name'], host['port'], jump_host)
-                            for key in 'reachable', 'hostname', 'ip', 'jump_host':
+                            for key in 'clear_name', 'reachable', 'hostname', 'ip', 'port', 'jump_host':
                                 host[key] = hostInfo[key]
 
                     if host['ip'] is not None and host['reachable']:
@@ -640,11 +693,16 @@ print(socket.gethostbyname('%s'))
                             newFingerPrint = hexlify(newKey.get_fingerprint()).decode('utf-8')
                             newKeyString = newKey.get_base64()
 
-                            utils.debug('    Saving new key (type {cyan}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, host['clear_name'], host['ip']), 1)
+                            msg = '    Saving new key (type {cyan}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, host['clear_name'], host['ip'])
+                            if jump_host is not None:
+                                msg += ', through jump hosts: %s' %(self.getJumpHostsStr(jump_host))
+                            utils.debug(msg, 1)
                             self.__host_keys.add(key_name, newKeyType, newKey)
                             newKeyInfo = self.getHostKeyInfo(self.__host_keys[key_name])
                             self.__known_hosts[key_name]['key'] = newKeyInfo
                             host_keys_changes = True
+                        except Exception as e:
+                            pass
 
             if host_keys_changes:
                 if self.__host_keys_filepath is not None:
@@ -964,10 +1022,9 @@ print(isOpen)
             utils.debug(msg, 4)
             ssh.connect(host, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, look_for_keys=False, sock=sock)
             result = True
-        except paramiko.BadHostKeyException as e:
-            raise e
         except Exception as e:
-            utils.debug('{red}fakeConnect: %s{reset}' %(e), 4)
+            utils.debug('{red}fakeConnect: %s: %s{reset}' %(type(e), e), 5)
+            raise e
         finally:
             ssh.close()
 
@@ -1189,29 +1246,31 @@ print(isOpen)
     def getConnection(self):
         return self.__conn
 
+def is_valid_file(parser, filepath):
+    try:
+        if filepath != '':
+            filepath = os.path.expanduser(filepath)
+            if os.path.isfile(filepath):
+                filepath = os.path.realpath(filepath)
+            else:
+                raise
+        else:
+            raise
+    except Exception as e:
+        parser.error('The file %s does not exist!' %(filepath))
+
+    return filepath
+
 def main():
-    filedir = '.'
-    knownHostsFilename = os.path.join(filedir, 'known_hosts')
-    hostsFilename = os.path.join(filedir, 'hosts_list')
+    hostsFilename = args.host_list
+    knownHostsFilename = args.known_hosts
 
     ssh = SSH()
-    ssh.autoSyncKnownHosts(knownHostsFilename, hostsFilename)
+    ssh.autoSyncKnownHosts(hostsFilename, knownHostsFilename)
 
 parser = argparse.ArgumentParser()
-#parser.add_argument('--action', dest='action', type=str, choices=['storage-retype', 'finalize'], required=True, help='Action to execute')
-#parser.add_argument('--cloud', dest='cloud', type=str, required=True, help='Cloud configuration name')
-#parser.add_argument('--vm', dest='vm_name', type=str, required=True, help='VM name')
-#parser.add_argument('--target-volume-type', dest='target_volume_type', type=str, choices=['NFS', 'NFS2', 'CEPH'], default='CEPH', help='Target volume type')
-#parser.add_argument('--volume-id', dest='volume_id', type=str, help='Volume ID')
-#parser.add_argument('--volume-snapshot-id', dest='snap_id', type=str, help='Volume snapshot ID')
-#parser.add_argument('--new-volume-id', dest='newvol_id', type=str, help='New volume ID (generated from volume snapshot)')
-#parser.add_argument('--image-id', dest='image_id', type=str, help='Image ID')
-#parser.add_argument('--key-name', dest='key_name', type=str, help='Key name')
-#parser.add_argument('--security-groups', dest='security_groups', type=str, help='Security groups (comma-separated)')
-#parser.add_argument('--flavor-name', dest='flavor_name', type=str, help='Flavor name')
-#parser.add_argument('--size', dest='vm_size', type=str, help='VM size (GiB)')
-#parser.add_argument('--ips', dest='ips', type=str, help='VM IP addresses (comma-separated, must match subnet-names in the same order)')
-#parser.add_argument('--keep', action='store_true', help='Keep temporary items')
+parser.add_argument('--host-list', dest='host_list', type=lambda f: is_valid_file(parser, f), required=True, help='host list filename')
+parser.add_argument('--known-hosts', dest='known_hosts', type=lambda f: is_valid_file(parser, f), default='~/.ssh/known_hosts', help='known_hosts filename')
 parser.add_argument('--verbose-level', dest='verbose_level', type=int, default=1, help='Verbose level [default 1]')
 args = parser.parse_args()
 
