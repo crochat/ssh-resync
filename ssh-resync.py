@@ -383,7 +383,7 @@ print(socket.gethostbyname('%s'))
 
         return result
 
-    def unhashKnownHosts(self):
+    def unhashKnownHosts(self, unhashed_known_hosts_filepath):
         result = False
 
         if self.__host_keys is not None and self.__known_hosts is not None:
@@ -407,9 +407,8 @@ print(socket.gethostbyname('%s'))
                         unhashed_host_keys.add(name, keyType, key)
 
             if len(unhashed_host_keys) > 0:
-                unhashed_host_keys_filepath = '%s.unhashed' %(self.__host_keys_filepath)
-                utils.debug('Recording a unhashed (as much as possible with found hosts) version of the known_hosts file in %s' %(unhashed_host_keys_filepath), 1)
-                unhashed_host_keys.save(unhashed_host_keys_filepath)
+                utils.debug('Recording a unhashed (as much as possible with found hosts) version of the known_hosts file in %s' %(unhashed_known_hosts_filepath), 1)
+                unhashed_host_keys.save(unhashed_known_hosts_filepath)
                 result = True
 
         return result
@@ -603,7 +602,7 @@ print(socket.gethostbyname('%s'))
 
         return jump_host
 
-    def autoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None):
+    def autoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None, unhashed_known_hosts_filepath=None):
         result = False
 
         if self.__host_keys_filepath is None and os.path.isfile(known_hosts_filepath):
@@ -704,10 +703,12 @@ print(socket.gethostbyname('%s'))
                         except Exception as e:
                             pass
 
+            if unhashed_known_hosts_filepath is not None:
+                self.unhashKnownHosts(unhashed_known_hosts_filepath)
+
             if host_keys_changes:
                 if self.__host_keys_filepath is not None:
                     #result = self.saveKnownHosts(self.__host_keys_filepath)
-                    result = True
                     if result:
                         self.__host_keys = None
                         self.loadKnownHosts(self.__host_keys_filepath)
@@ -1246,31 +1247,89 @@ print(isOpen)
     def getConnection(self):
         return self.__conn
 
-def is_valid_file(parser, filepath):
+def check_path(path, mode='r', a_path=None):
+    check_done = False
+    mode_list = []
+
+    if 'r' in mode:
+        mode_list.append('r')
+    if 'w' in mode:
+        mode_list.append('w')
+
+    if path != '':
+        path = os.path.expanduser(path)
+        path = os.path.realpath(path)
+    else:
+        path = None
+
+    if path is None:
+        print('The path cannot be empty!')
+        return path
+
+    old_path = path
+
+    if a_path is None:  # first call: prepare an "accumulative" path for the terminal recursivity
+        path_list = path.split(os.path.sep)
+        a_path_list = []
+        path = path_list[0]
+        if path == '':
+            path = os.path.sep
+        if len(path_list) > 0:
+            a_path = os.path.join(path, path_list[1])
+    elif path == a_path:
+        path_list = path.split(os.path.sep)
+        a_path_list = a_path.split(os.path.sep)
+        check_done = True
+    else:
+        path_list = path.split(os.path.sep)
+        a_path_list = a_path.split(os.path.sep)
+        path = a_path
+        a_path = os.path.join(a_path, path_list[len(a_path_list)])
+
+    path_type = None
+    if not os.path.exists(path) and 'r' in mode_list:
+        raise Exception('The path "%s" does not exist!' %(path))
+
+    if os.path.isfile(path):
+        path_type = 'file'
+    elif os.path.isdir(path):
+        path_type = 'directory'
+
+    if not check_done and path_type == 'directory':
+        if not os.access(path, os.X_OK):
+            raise Exception('You don\'t have the required permissions to list the content of the %s "%s"!' %(path_type, path))
+
+    if 'r' in mode_list and not os.access(path, os.R_OK):
+        raise Exception('You don\'t have the required permissions to read the %s "%s"!' %(path_type, path))
+
+    if 'w' in mode_list:
+        if len(a_path_list) == len(path_list) - 1 and not os.access(path, os.W_OK):
+            raise Exception('You don\'t have the required permissions to write in the %s "%s"!' %(path_type, path))
+        if len(a_path_list) == len(path_list) and path_type is not None and not os.access(path, os.W_OK):
+            raise Exception('You don\'t have the required permissions to write in the %s "%s"!' %(path_type, path))
+
+    if not check_done:
+        path = check_path(old_path, mode, a_path)
+
+    return path
+
+def is_valid_file(parser, filepath, mode='r'):
     try:
-        if filepath != '':
-            filepath = os.path.expanduser(filepath)
-            if os.path.isfile(filepath):
-                filepath = os.path.realpath(filepath)
-            else:
-                raise
-        else:
-            raise
+        check_path(filepath, mode)
     except Exception as e:
-        parser.error('The file %s does not exist!' %(filepath))
+        parser.error(e)
 
     return filepath
 
 def main():
-    hostsFilename = args.host_list
-    knownHostsFilename = args.known_hosts
-
+    sys.exit()
     ssh = SSH()
-    ssh.autoSyncKnownHosts(hostsFilename, knownHostsFilename)
+    ssh.autoSyncKnownHosts(args.host_list, args.known_hosts, args.unhashed_known_hosts)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--host-list', dest='host_list', type=lambda f: is_valid_file(parser, f), required=True, help='host list filename')
 parser.add_argument('--known-hosts', dest='known_hosts', type=lambda f: is_valid_file(parser, f), default='~/.ssh/known_hosts', help='known_hosts filename')
+parser.add_argument('--unhashed-known-hosts', dest='unhashed_known_hosts', type=lambda f: is_valid_file(parser, f, 'w'), help='Unhashed known_hosts filename (found hosts will be extracted in clear text)')
 parser.add_argument('--verbose-level', dest='verbose_level', type=int, default=1, help='Verbose level [default 1]')
 args = parser.parse_args()
 
