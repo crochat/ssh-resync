@@ -1315,14 +1315,13 @@ def check_path(path, mode='r', a_path=None):
 
 def is_valid_file(parser, filepath, mode='r'):
     try:
-        check_path(filepath, mode)
+        filepath = check_path(filepath, mode)
     except Exception as e:
         parser.error(e)
 
     return filepath
 
 def main():
-    sys.exit()
     ssh = SSH()
     ssh.autoSyncKnownHosts(args.host_list, args.known_hosts, args.unhashed_known_hosts)
 
