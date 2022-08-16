@@ -708,7 +708,7 @@ print(socket.gethostbyname('%s'))
 
             if host_keys_changes:
                 if self.__host_keys_filepath is not None:
-                    #result = self.saveKnownHosts(self.__host_keys_filepath)
+                    result = self.saveKnownHosts(self.__host_keys_filepath)
                     if result:
                         self.__host_keys = None
                         self.loadKnownHosts(self.__host_keys_filepath)
