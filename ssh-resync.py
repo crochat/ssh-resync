@@ -142,11 +142,15 @@ class SSH:
     __jump_hosts = None
     __resolves = {}
     __known_hosts = None
+    __host_list_filepath = None
     __host_keys_filepath = None
     __host_keys_filepath_stats = None
     __host_keys_backup_filepath = None
     __host_keys = None
-    __host_list_filepath = None
+    __unknown_hosts = []
+    __seen_keys = {}
+    __doubled_keys = {}
+    __still_unreachable_hosts = []
 
     def __init__(self):
         pass
@@ -248,7 +252,7 @@ class SSH:
             pass
 
         if result is None:
-            if hostname in self.__resolves:
+            if hostname in self.__resolves and jump_host is None:
                 utils.debug('Taking <{cyan}%s{reset}> matching IP from previously resolved hostnames' %(hostname), 3)
                 result = self.__resolves[hostname]
             else:
@@ -259,7 +263,7 @@ import socket
 print(socket.gethostbyname('%s'))
 """ %(hostname)
 
-                        utils.debug('Trying to resolve {cyan}%s{reset} from jump host <{cyan}%s@%s:%s{reset}>' %(hostname, jump_host['user'], jump_host['host'], jump_host['port']), 3)
+                        utils.debug('Trying to resolve {cyan}%s{reset} from jump host <{magenta}%s@%s:%s{reset}>' %(hostname, jump_host['user'], jump_host['host'], jump_host['port']), 3)
                         res = self.jumpExec(cmd, jump_host)
                         if res is not None:
                             for line in res:
@@ -317,7 +321,7 @@ print(socket.gethostbyname('%s'))
             except Exception as e:
                 pass
 
-            if result['ip'] is None:
+            if result['ip'] is None or jump_host is not None:
                 result['hostname'] = hostname
                 ip = self.resolveHostname(hostname, jump_host)
                 if ip is not None:
@@ -420,10 +424,10 @@ print(socket.gethostbyname('%s'))
             for jump_host in self.__jump_hosts:
                 if result != '':
                     result += '\n'
-                result += '{magenta}%s{reset}: {cyan}%s@%s:%s{reset}' %(jump_host['jump_host_idx'] + 1, jump_host['user'], jump_host['host'], jump_host['port'])
+                result += '{lightred}%s{reset}: {magenta}%s@%s:%s{reset}' %(jump_host['jump_host_idx'] + 1, jump_host['user'], jump_host['host'], jump_host['port'])
                 if jump_host['linked_jump_host_idx'] is not None:
                     linked_idx = jump_host['linked_jump_host_idx']
-                    result += ' (linked to {magenta}%s{reset}: {cyan}%s@%s:%s{reset})' %(self.__jump_hosts[linked_idx]['jump_host_idx'] + 1, self.__jump_hosts[linked_idx]['user'], self.__jump_hosts[linked_idx]['host'], self.__jump_hosts[linked_idx]['port'])
+                    result += ' (linked to {lightred}%s{reset}: {magenta}%s@%s:%s{reset})' %(self.__jump_hosts[linked_idx]['jump_host_idx'] + 1, self.__jump_hosts[linked_idx]['user'], self.__jump_hosts[linked_idx]['host'], self.__jump_hosts[linked_idx]['port'])
         return result
 
     def getLinkedJumpHosts(self, jump_host):
@@ -489,7 +493,7 @@ print(socket.gethostbyname('%s'))
         if go_ahead:
             jump_host = self.connectJump(host, user, password=password, port=port, jump_host=linked_jump_host)
             if jump_host is not None:
-                utils.debug('{green}Successfully connected to {cyan}%s@%s:%s{reset}' %(jump_host['user'], jump_host['host'], jump_host['port']), 2)
+                utils.debug('{green}Successfully connected to {magenta}%s@%s:%s{reset}' %(jump_host['user'], jump_host['host'], jump_host['port']), 2)
             else:
                 go_ahead = False
 
@@ -627,12 +631,12 @@ print(socket.gethostbyname('%s'))
                             nb_reachable_known_hosts += 1
                         else:
                             nb_unreachable_known_hosts += 1
-                utils.debug('''  Total hosts: {magenta}%s{reset}
-    Hashed names: {magenta}%s{reset} (we will need the host list file to find hosts behind their hash!)
-    Unhashed (clear) names: {magenta}%s{reset}:
-        Reachable: {magenta}%s{reset}
-        Unreachable (will require jump hosts): {magenta}%s{reset}:
-            Unresolvable (no DNS match): {magenta}%s{reset}''' %(nb_known_hosts, nb_hashed_known_hosts, nb_unhashed_known_hosts, nb_reachable_known_hosts, nb_unreachable_known_hosts, nb_unresolvable_known_hosts), timestamp=False)
+                utils.debug('''  Total hosts: {lightred}%s{reset}
+    Hashed names: {lightred}%s{reset} (we will need the host list file to find hosts behind their hash!)
+    Unhashed (clear) names: {lightred}%s{reset}:
+        Reachable: {lightred}%s{reset}
+        Unreachable (will require jump hosts): {lightred}%s{reset}:
+            Unresolvable (no DNS match): {lightred}%s{reset}''' %(nb_known_hosts, nb_hashed_known_hosts, nb_unhashed_known_hosts, nb_reachable_known_hosts, nb_unreachable_known_hosts, nb_unresolvable_known_hosts), timestamp=False)
 
         if self.__known_hosts is not None and os.path.isfile(hosts_filepath):
             utils.debug('Parsing hosts list file {cyan}%s{reset}, and checking the networking details and connectivity of every host which appears in {cyan}%s{reset}. This may take a while...' %(hosts_filepath, known_hosts_filepath))
@@ -651,6 +655,13 @@ print(socket.gethostbyname('%s'))
 
                     if host['key'] is not None:
                         fingerPrint = host['key']['finger_print']
+                        keyString = host['key']['key_string']
+                        if host['clear_name'] is not None and keyString in self.__seen_keys:
+                            if self.__seen_keys[keyString]['clear_name'] == host['clear_name']:
+                                if keyString not in self.__doubled_keys:
+                                    self.__doubled_keys[keyString] = [self.__seen_keys[keyString], host]
+                                else:
+                                    self.__doubled_keys[keyString].append(host)
 
                     if host['clear_name'] is not None and not host['reachable']:
                         tmp_jump_host = self.autoCheckJumpHosts(host)
@@ -670,6 +681,9 @@ print(socket.gethostbyname('%s'))
                             for key in 'clear_name', 'reachable', 'hostname', 'ip', 'port', 'jump_host':
                                 host[key] = hostInfo[key]
 
+                        if not host['reachable']:
+                            self.__still_unreachable_hosts.append(host)
+
                     if host['ip'] is not None and host['reachable']:
                         try:
                             self.fakeConnect(host['clear_name'], port=host['port'], jump_host=jump_host)
@@ -683,16 +697,16 @@ print(socket.gethostbyname('%s'))
 
                             current_key = e.expected_key
                             newKey = e.key
-                            utils.debug('Bad host key for IP <{cyan}%s{reset}> (fingerprint <{cyan}%s{reset}>)!' %(host['ip'], fingerPrint), 4)
+                            utils.debug('Bad host key for IP <{cyan}%s{reset}> (fingerprint <{pink}%s{reset}>)!' %(host['ip'], fingerPrint), 4)
 
-                            utils.debug('    Replacing fingerprint <{cyan}%s{reset}>, using the IP <{cyan}%s{reset}> to reach the host' %(fingerPrint, host['ip']), 2)
+                            utils.debug('    Replacing fingerprint <{pink}%s{reset}>, using the IP <{cyan}%s{reset}> to reach the host' %(fingerPrint, host['ip']), 2)
                             self.__known_hosts[key_name]['replaced_key'] = self.__known_hosts[key_name]['key']
 
                             newKeyType = newKey.get_name()
                             newFingerPrint = hexlify(newKey.get_fingerprint()).decode('utf-8')
                             newKeyString = newKey.get_base64()
 
-                            msg = '    Saving new key (type {cyan}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, host['clear_name'], host['ip'])
+                            msg = '    Saving new key (type {pink}%s{reset}) for host <{cyan}%s{reset}> (IP <{cyan}%s{reset}>)' %(newKeyType, host['clear_name'], host['ip'])
                             if jump_host is not None:
                                 msg += ', through jump hosts: %s' %(self.getJumpHostsStr(jump_host))
                             utils.debug(msg, 1)
@@ -700,8 +714,22 @@ print(socket.gethostbyname('%s'))
                             newKeyInfo = self.getHostKeyInfo(self.__host_keys[key_name])
                             self.__known_hosts[key_name]['key'] = newKeyInfo
                             host_keys_changes = True
+                        except paramiko.SSHException as e:
+                            if str(e) == 'No authentication methods available':
+                                msg = '{green}Host <{cyan}%s{green}> (IP <{cyan}%s{green}>)' %(host['clear_name'], host['ip'])
+                                if jump_host is not None:
+                                    msg += ' (through jump hosts: %s)' %(self.getJumpHostsStr(jump_host))
+                                msg += ' <{pink}%s{green}> SSH key: OK{reset}' %(host['key']['key_type'])
+                                utils.debug(msg)
                         except Exception as e:
                             pass
+
+                    if host['clear_name'] is not None and host['key'] is not None:
+                        self.__seen_keys[host['key']['key_string']] = host
+
+            for host in self.__known_hosts:
+                if self.__known_hosts[host]['clear_name'] is None:
+                    self.__unknown_hosts.append(self.__known_hosts[host])
 
             if unhashed_known_hosts_filepath is not None:
                 self.unhashKnownHosts(unhashed_known_hosts_filepath)
@@ -738,7 +766,7 @@ finally:
 print(isOpen)
 """ %(timeout, ip, port)
 
-            utils.debug('Checking if <%s:%s> is reachable from jump host <%s@%s:%s>' %(ip, port, jump_host['user'], jump_host['host'], jump_host['port']), 2)
+            utils.debug('Checking if <{cyan}%s:%s{cyan}> is reachable from jump host <{magenta}%s@%s:%s{reset}>' %(ip, port, jump_host['user'], jump_host['host'], jump_host['port']), 2)
             res = self.jumpExec(code, jump_host)
             if res is not None:
                 for line in res:
@@ -760,6 +788,49 @@ print(isOpen)
                 s.close()
 
         return isOpen
+
+    def finalAnalysis(self):
+        nb_known_hosts = len(self.__known_hosts)
+        nb_hashed_known_hosts = 0
+        nb_unhashed_known_hosts = 0
+        nb_unresolvable_known_hosts = 0
+        nb_reachable_known_hosts = 0
+        nb_unreachable_known_hosts = 0
+        for host_name in self.__known_hosts:
+            tmp_host = self.__known_hosts[host_name]
+            if tmp_host['clear_name'] is None:
+                nb_hashed_known_hosts += 1
+            else:
+                nb_unhashed_known_hosts += 1
+                if tmp_host['ip'] is None:
+                    nb_unresolvable_known_hosts += 1
+                if tmp_host['reachable']:
+                    nb_reachable_known_hosts += 1
+                else:
+                    nb_unreachable_known_hosts += 1
+        utils.debug('''Global process numbers:
+    Total hosts: {lightred}%s{reset}
+    Hashed names: {lightred}%s{reset} (we didn't find a match in the host list file)
+    Unhashed (clear) names: {lightred}%s{reset}:
+        Reachable: {lightred}%s{reset}
+        Unreachable (requires jump hosts): {lightred}%s{reset}:
+            Unresolvable (no DNS match): {lightred}%s{reset}''' %(nb_known_hosts, nb_hashed_known_hosts, nb_unhashed_known_hosts, nb_reachable_known_hosts, nb_unreachable_known_hosts, nb_unresolvable_known_hosts), timestamp=False)
+
+        if len(self.__still_unreachable_hosts) > 0:
+            print('\n')
+        for host in self.__still_unreachable_hosts:
+            utils.debug('    {yellow}WARNING: The host <{cyan}%s{yellow}> (IP <{cyan}%s{yellow}>, key type <{pink}%s{yellow}> with string <{pink}%s{yellow}>, at line <{lightred}%s{yellow}>) was left unreachable, which means unchecked!{reset}' %(host['clear_name'], host['ip'], host['key']['key_type'], host['key']['key_string'], host['lineno']), timestamp=False)
+
+        if len(self.__doubled_keys) > 0:
+            print('\n')
+        for key in self.__doubled_keys:
+            keyString = self.__doubled_keys[key][0]['key']['key_string']
+            keyType = self.__doubled_keys[key][0]['key']['key_type']
+            hostName = self.__doubled_keys[key][0]['clear_name']
+            lines = []
+            for host in self.__doubled_keys[key]:
+                lines.append(host['lineno'])
+            utils.debug('    {yellow}WARNING: The <{pink}%s{yellow}> SSH key with string <{pink}%s{yellow}> has been seen multiple times (at lines <{lightred}%s{yellow}>) for the same host name <{cyan}%s{yellow}>!{reset}' %(keyType, keyString, ','.join([str(v) for v in lines]), hostName), timestamp=False)
 
     def checkHost(self, host, port=22, timeout=2, retries=3, delay=0.1, jump_host=None):
         isUp = False
@@ -981,7 +1052,7 @@ print(isOpen)
         result = None
 
         if jump_host is not None and target_host is not None:
-            utils.debug('Attempting to prepare a transport channel from the jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port']), 4)
+            utils.debug('Attempting to prepare a transport channel from the jump host <{magenta}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port']), 4)
 
             jump_conn = None
             jump_transport = None
@@ -1019,7 +1090,7 @@ print(isOpen)
         try:
             msg = 'fakeConnect: Checking the server key for <{cyan}%s:%s{reset}>' %(host, port)
             if jump_host is not None:
-                msg += ', using jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
+                msg += ', using jump host <{magenta}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
             utils.debug(msg, 4)
             ssh.connect(host, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, look_for_keys=False, sock=sock)
             result = True
@@ -1039,7 +1110,7 @@ print(isOpen)
 
         if self.__jump_hosts is not None and len(self.__jump_hosts) > 0:
             if '%s@%s:%s' %(user, host, port) in ['%s@%s:%s' %(d['user'], d['host'], d['port']) for d in self.__jump_hosts]:
-                utils.debug('{red}connectJump: The combination <{cyan}%s@%s:%s{red}> already exist in the jump hosts!{reset}' %(user, host, port))
+                utils.debug('{red}connectJump: The combination <{magenta}%s@%s:%s{red}> already exist in the jump hosts!{reset}' %(user, host, port))
                 return result
 
         if jump_host is not None:
@@ -1055,9 +1126,9 @@ print(isOpen)
             if sock is None:
                 return result
 
-        msg = 'Trying to connect <{cyan}%s@%s:%s{reset}>' %(user, host, port)
+        msg = 'Trying to connect <{magenta}%s@%s:%s{reset}>' %(user, host, port)
         if sock is not None:
-            msg += ', using a transport channel prepared from jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
+            msg += ', using a transport channel prepared from jump host <{magenta}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
         utils.debug(msg, 2)
         res = self.connect(host, user, password=password, port=port, timeout=timeout, banner_timeout=banner_timeout, auth_timeout=auth_timeout, filename=filename, sock=sock)
         if res:
@@ -1083,7 +1154,7 @@ print(isOpen)
 
             cmd = "python3 -c \"import base64; exec(base64.b64decode('%s').decode())\"" %(codeEncodedString)
             try:
-                utils.debug('Executing code on jump host <%s@%s:%s>' %(jump_host['user'], jump_host['host'], jump_host['port']), 3)
+                utils.debug('Executing code on jump host <{magenta}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port']), 3)
                 stdin, stdout, stderr = jump_host['conn'].exec_command(cmd)
                 if stderr.read() == b'':
                     result = stdout.readlines()
@@ -1326,6 +1397,7 @@ def is_valid_file(parser, filepath, mode='r'):
 def main():
     ssh = SSH()
     ssh.autoSyncKnownHosts(args.host_list, args.known_hosts, args.unhashed_known_hosts)
+    ssh.finalAnalysis()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--host-list', dest='host_list', type=lambda f: is_valid_file(parser, f), required=True, help='host list filename')
