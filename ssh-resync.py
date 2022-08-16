@@ -1274,6 +1274,8 @@ def check_path(path, mode='r', a_path=None):
         path = path_list[0]
         if path == '':
             path = os.path.sep
+        elif ':' in path:
+            path += os.sep
         if len(path_list) > 0:
             a_path = os.path.join(path, path_list[1])
     elif path == a_path:
