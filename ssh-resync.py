@@ -18,6 +18,49 @@ import time
 from datetime import timezone
 import datetime
 
+if os.name == 'nt':
+    class Grp:
+        def getgrgid(self, id):
+            return {}
+
+        def getgrnam(self, name):
+            return {}
+
+        def getgrall(self):
+            return []
+    grp = Grp()
+
+    class Pwd:
+        class struct_passwd:
+            pw_name = None
+            pw_passwd = None
+            pw_uid = None
+            pw_gid = None
+            pw_gecos = None
+            pw_dir = None
+            pw_shell = None
+
+        def getpwuid(self, uid):
+            return {}
+
+        def getpwnam(self, name):
+            pwd = self.struct_passwd()
+            pw_dir = os.path.join('C:', os.sep, 'Users', name)
+            if os.path.exists(pw_dir):
+                pwd.pw_name = name
+                pwd.pw_uid = 0
+                pwd.pw_gid = 0
+                pwd.pw_dir = os.path.expanduser(pw_dir)
+                pwd.pw_shell = 'sh'
+            return pwd
+
+        def getpwall(self):
+            return [self.getpwnam(os.getlogin())]
+    pwd = Pwd()
+else:
+    import grp
+    import pwd
+
 class colors:
     '''Colors class:reset all colors with colors.reset; two
     sub classes fg for foreground
@@ -153,7 +196,15 @@ class SSH:
     __still_unreachable_hosts = []
 
     def __init__(self):
-        pass
+        self.__known_hosts = None
+        self.__host_keys_filepath = None
+        self.__host_keys_filepath_stats = None
+        self.__host_keys_backup_filepath = None
+        self.__host_keys = None
+        self.__unknown_hosts = []
+        self.__seen_keys = {}
+        self.__doubled_keys = {}
+        self.__still_unreachable_hosts = []
 
     def parseHostsFile(self, hosts_filepath):
         result = False
@@ -606,7 +657,39 @@ print(socket.gethostbyname('%s'))
 
         return jump_host
 
-    def autoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None, unhashed_known_hosts_filepath=None):
+    def autoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None, unhashed_known_hosts_filepath=None, all_users=False):
+        known_hosts_filepath_list = []
+
+        if known_hosts_filepath is None:
+            user_list = []
+            if all_users:
+                users = pwd.getpwall()
+                for user in users:
+                    if user.pw_shell.endswith('sh'):
+                        if user.pw_uid not in [u.pw_uid for u in user_list]:
+                            user_list.append(user)
+            else:
+                user_list.append(pwd.getpwnam(os.getlogin()))
+
+            for user in user_list:
+                known_hosts_filepath_list.append(os.path.join(user.pw_dir, '.ssh', 'known_hosts'))
+        else:
+            known_hosts_filepath_list.append(known_hosts_filepath)
+
+        for known_hosts_filepath in known_hosts_filepath_list:
+            try:
+                known_hosts_filepath = check_path(known_hosts_filepath)
+
+                self.__init__()
+                self.singleAutoSyncKnownHosts(hosts_filepath, known_hosts_filepath, unhashed_known_hosts_filepath)
+                self.finalAnalysis()
+            except Exception as e:
+                utils.debug('{red}%s{reset}' %(e))
+                if not args.force:
+                    utils.debug('{yellow}You can use --force if you want to skip these errors and continue anyway.{reset}')
+                    sys.exit(1)
+
+    def singleAutoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None, unhashed_known_hosts_filepath=None):
         result = False
 
         if self.__host_keys_filepath is None and os.path.isfile(known_hosts_filepath):
@@ -1386,7 +1469,10 @@ def check_path(path, mode='r', a_path=None):
 
     return path
 
-def is_valid_file(parser, filepath, mode='r'):
+def is_valid_file(parser, field, filepath=None, mode='r'):
+    if filepath is None and field == 'known_hosts':
+        return filepath
+
     try:
         filepath = check_path(filepath, mode)
     except Exception as e:
@@ -1396,13 +1482,14 @@ def is_valid_file(parser, filepath, mode='r'):
 
 def main():
     ssh = SSH()
-    ssh.autoSyncKnownHosts(args.host_list, args.known_hosts, args.unhashed_known_hosts)
-    ssh.finalAnalysis()
+    ssh.autoSyncKnownHosts(args.host_list, args.known_hosts, args.unhashed_known_hosts, args.all_users)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--host-list', dest='host_list', type=lambda f: is_valid_file(parser, f), required=True, help='host list filename')
-parser.add_argument('--known-hosts', dest='known_hosts', type=lambda f: is_valid_file(parser, f), default='~/.ssh/known_hosts', help='known_hosts filename')
-parser.add_argument('--unhashed-known-hosts', dest='unhashed_known_hosts', type=lambda f: is_valid_file(parser, f, 'w'), help='Unhashed known_hosts filename (found hosts will be extracted in clear text)')
+parser.add_argument('--host-list', dest='host_list', type=lambda f: is_valid_file(parser, 'host_list', f), required=True, help='host list filename')
+parser.add_argument('--known-hosts', dest='known_hosts', type=lambda f: is_valid_file(parser, 'known_hosts', f), default=None, help='known_hosts filename')
+parser.add_argument('--unhashed-known-hosts', dest='unhashed_known_hosts', type=lambda f: is_valid_file(parser, 'unhashed_shown_hosts', f, 'w'), help='Unhashed known_hosts filename (found hosts will be extracted in clear text)')
+parser.add_argument('--all-users', dest='all_users', action='store_true', default=False, help='Run the script for all users on the machine')
+parser.add_argument('--force', dest='force', action='store_true', default=False, help='Run the script even in case of errors, especially permissions errors. Used with --all-users')
 parser.add_argument('--verbose-level', dest='verbose_level', type=int, default=1, help='Verbose level [default 1]')
 args = parser.parse_args()
 
