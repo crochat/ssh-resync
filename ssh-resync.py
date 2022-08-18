@@ -316,23 +316,30 @@ print(socket.gethostbyname('%s'))
 
                         utils.debug('Trying to resolve {cyan}%s{reset} from jump host <{magenta}%s@%s:%s{reset}>' %(hostname, jump_host['user'], jump_host['host'], jump_host['port']), 3)
                         res = self.jumpExec(cmd, jump_host)
-                        if res is not None:
-                            for line in res:
-                                line = line.strip()
+                        if res['stdout'] is not None:
+                            for line in res['stdout']:
                                 try:
                                     socket.inet_aton(line)
                                     result = line
                                 except Exception as e:
-                                    pass
+                                    raise e
                                 if result is not None:
                                     utils.debug('result: <%s>' %(result), 3)
                                     break
+                        elif res['stderr'] is not None:
+                            for line in res['stderr']:
+                                if 'socket.gaierror' in line.lower():
+                                    raise Exception(line)
                     else:
                         utils.debug('Trying to resolve {cyan}%s{reset}' %(hostname), 3)
                         ip = socket.gethostbyname(hostname)
                         result = ip
                 except Exception as e:
-                    utils.debug('{red}Failed to resolve {cyan}%s{red}!{reset}' %(hostname), 2)
+                    msg = '{red}Failed to resolve <{cyan}%s{red}{reset}>' %(hostname)
+                    if jump_host is not None:
+                        msg += ' {red}from jump host <{cyan}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
+                    msg += '{red}!{reset}'
+                    utils.debug(msg, 2)
 
         if result is not None and hostname not in self.__resolves:
             self.__resolves[hostname] = result
@@ -356,10 +363,10 @@ print(socket.gethostbyname('%s'))
         else:
             clear_name = hostname
             if ':' in clear_name:
-                clear_name = clear_name.split(':')
-                if len(clear_name) > 1 and clear_name[1] != '' and clear_name[1].isnumeric() and port is None:
-                    port = int(clear_name[1])
-                hostname = clear_name[0]
+                clear_name_parts = clear_name.split(':')
+                if len(clear_name_parts) > 1 and clear_name_parts[1] != '' and clear_name_parts[1].isnumeric() and port is None:
+                    port = int(clear_name_parts[1])
+                hostname = str(clear_name_parts[0]).strip('[ ]')
             if port is None:
                 port = 22
 
@@ -386,7 +393,6 @@ print(socket.gethostbyname('%s'))
                     result['reachable'] = True
                 else:
                     utils.debug('{red}Host IP check failed: <{cyan}%s{red}>!{reset}' %(result['ip']), 2)
-
         return result
 
     def saveKnownHosts(self, known_hosts_filepath):
@@ -669,7 +675,7 @@ print(socket.gethostbyname('%s'))
                         if user.pw_uid not in [u.pw_uid for u in user_list]:
                             user_list.append(user)
             else:
-                user_list.append(pwd.getpwnam(os.getlogin()))
+                user_list.append(pwd.getpwnam(os.getenv('USER')))
 
             for user in user_list:
                 known_hosts_filepath_list.append(os.path.join(user.pw_dir, '.ssh', 'known_hosts'))
@@ -681,7 +687,7 @@ print(socket.gethostbyname('%s'))
                 known_hosts_filepath = check_path(known_hosts_filepath)
 
                 self.__init__()
-                self.singleAutoSyncKnownHosts(hosts_filepath, known_hosts_filepath, unhashed_known_hosts_filepath)
+                self.singleAccountAutoSyncKnownHosts(hosts_filepath, known_hosts_filepath, unhashed_known_hosts_filepath)
                 self.finalAnalysis()
             except Exception as e:
                 utils.debug('{red}%s{reset}' %(e))
@@ -689,7 +695,7 @@ print(socket.gethostbyname('%s'))
                     utils.debug('{yellow}You can use --force if you want to skip these errors and continue anyway.{reset}')
                     sys.exit(1)
 
-    def singleAutoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None, unhashed_known_hosts_filepath=None):
+    def singleAccountAutoSyncKnownHosts(self, hosts_filepath, known_hosts_filepath=None, unhashed_known_hosts_filepath=None):
         result = False
 
         if self.__host_keys_filepath is None and os.path.isfile(known_hosts_filepath):
@@ -769,7 +775,10 @@ print(socket.gethostbyname('%s'))
 
                     if host['ip'] is not None and host['reachable']:
                         try:
-                            self.fakeConnect(host['clear_name'], port=host['port'], jump_host=jump_host)
+                            hostTarget = host['ip']
+                            if host['hostname'] is not None:
+                                hostTarget = host['hostname']
+                            self.fakeConnect(hostTarget, port=host['port'], jump_host=jump_host)
                         except paramiko.BadHostKeyException as e:
                             if self.__host_keys_backup_filepath is None:
                                 self.__host_keys_backup_filepath = '%s.old' %(self.__host_keys_filepath)
@@ -851,9 +860,8 @@ print(isOpen)
 
             utils.debug('Checking if <{cyan}%s:%s{cyan}> is reachable from jump host <{magenta}%s@%s:%s{reset}>' %(ip, port, jump_host['user'], jump_host['host'], jump_host['port']), 2)
             res = self.jumpExec(code, jump_host)
-            if res is not None:
-                for line in res:
-                    line = line.strip()
+            if res['stdout'] is not None:
+                for line in res['stdout']:
                     utils.debug('result: <%s>' %(line), 2)
                     if line == 'True':
                         isOpen = True
@@ -1230,25 +1238,31 @@ print(isOpen)
         return result
 
     def jumpExec(self, code, jump_host):
-        result = None
+        result = {'stdout': None, 'stderr': None}
 
         if jump_host is not None:
             codeEncodedString = base64.b64encode(code.encode()).decode()
 
+            utils.debug('jumpExec: code: %s' %(code), 6)
             cmd = "python3 -c \"import base64; exec(base64.b64decode('%s').decode())\"" %(codeEncodedString)
+            utils.debug('jumpExec: executing command <%s> on remote host' %(cmd), 6)
             try:
                 utils.debug('Executing code on jump host <{magenta}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port']), 3)
                 stdin, stdout, stderr = jump_host['conn'].exec_command(cmd)
-                if stderr.read() == b'':
-                    result = stdout.readlines()
-                if proc.stderr != '':
-                    utils.debug('{red}jumpExec: Error when executing the requested code: %s{reset}' %(proc.stderr))
-                    raise Exception(proc.stderr)
-
-                result = proc.stdout.strip()
+                result['stdout'] = stdout.readlines()
+                result['stderr'] = stderr.readlines()
+                for key in ['stdout', 'stderr']:
+                    if len(result[key]) == 0:
+                        result[key] = None
+                    else:
+                        clean_list = []
+                        for line in result[key]:
+                            clean_list.append(line.strip())
+                        result[key] = clean_list
             except Exception as e:
                 pass
 
+        utils.debug('jumpExec: result: <%s>' %(result), 6)
         return result
 
     def tryAuthMethods(self, host, port=22, skipMethods=None, timeout=2):
