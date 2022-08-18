@@ -223,24 +223,37 @@ class SSH:
                         hostnames = None
 
                         item = fields[i]
+                        utils.debug('parseHostsFile: item: <{cyan}%s{reset}>' %(item), 5)
                         if item.startswith('#'):
                             break
 
                         if item not in foundItems:
+                            utils.debug('parseHostsFile: item <{cyan}%s{reset}> not in foundItems (first time seeing it)' %(item), 6)
                             utils.debug('Searching for %s in %s' %(item, self.__host_keys_filepath), 5)
                             hostnames = self.lookupKnownHosts(item)
                             if hostnames is not None:
                                 utils.debug('Found item <{cyan}%s{reset}> in %s' %(item, self.__host_keys_filepath), 2)
                                 foundItems.append(item)
+                            else:
+                                utils.debug('parseHostsFile: item <{cyan}%s{reset}> has no hostnames!' %(item), 6)
+                        else:
+                            utils.debug('parseHostsFile: item <{cyan}%s{reset}> already in foundItems' %(item), 6)
 
                         if hostnames is not None:
+                            utils.debug('parseHostsFile: parsing item <{cyan}%s{reset}> hostnames' %(item), 6)
                             for hostname in hostnames:
                                 h = hostname['hostname']
                                 if h in self.__known_hosts:
                                     if self.__known_hosts[h]['hashed'] and self.__known_hosts[h]['clear_name'] is None:
-                                        hostnameInfo = self.getHostnameInfo(item)
-                                        for key in ['clear_name', 'reachable', 'hostname', 'ip']:
-                                            self.__known_hosts[h][key] = hostnameInfo[key]
+                                        utils.debug('parseHostsFile: item <{cyan}%s{reset}> hashed. Getting host info...' %(item), 6)
+                                        hostInfo = self.getHostnameInfo(item)
+                                        utils.debug('parseHostsFile: host info: <%s>' %(hostInfo), 6)
+                                        for key in ['clear_name', 'reachable', 'hostname', 'ip', 'port']:
+                                            self.__known_hosts[h][key] = hostInfo[key]
+                                    else:
+                                        utils.debug('parseHostsFile: item <{cyan}%s{reset}> not hashed (%s), or already having a clear name (%s)' %(item, self.__known_hosts[h]['hashed'], self.__known_hosts[h]['clear_name']), 6)
+                                else:
+                                    utils.debug('parseHostsFile: item <{cyan}%s{reset}> hostname <%s> not in known_hosts' %(item, h), 6)
 
                 result = True
 
@@ -738,6 +751,8 @@ print(socket.gethostbyname('%s'))
             if len(self.__known_hosts) > 0:
                 for key_name in self.__host_keys.keys():
                     host = self.__known_hosts[key_name]
+                    utils.debug('Working on host <{cyan}%s{reset}>' %(key_name), 5)
+                    utils.debug('Host details: %s' %(host), 6)
 
                     jump_host = None
                     fingerPrint = None
@@ -746,16 +761,20 @@ print(socket.gethostbyname('%s'))
                         fingerPrint = host['key']['finger_print']
                         keyString = host['key']['key_string']
                         if host['clear_name'] is not None and keyString in self.__seen_keys:
+                            utils.debug('Host <{cyan}%s{reset}> has been already seen' %(host['clear_name']), 5)
                             if self.__seen_keys[keyString]['clear_name'] == host['clear_name']:
+                                utils.debug('Host <{cyan}%s{reset}> has been already seen with the exact same referenced name <{cyan}%s{reset}>' %(key_name, host['clear_name']), 5)
                                 if keyString not in self.__doubled_keys:
                                     self.__doubled_keys[keyString] = [self.__seen_keys[keyString], host]
                                 else:
                                     self.__doubled_keys[keyString].append(host)
 
                     if host['clear_name'] is not None and not host['reachable']:
+                        utils.debug('Host <{cyan}%s{reset}> is not reachable yet. Working with jump hosts...' %(host['clear_name']), 5)
                         tmp_jump_host = self.autoCheckJumpHosts(host)
                         if tmp_jump_host is not None:
                             jump_host = tmp_jump_host
+                            utils.debug('Host <{cyan}%s{reset}>: found a working jump host <{magenta}%s@%s:%s{reset}>' %(host['clear_name'], jump_host['user'], jump_host['host'], jump_host['port']), 5)
                         else:
                             sys.stdout.write('The host <%s> is not (directly) reachable. Do you have access to a jump host that you want to configure here [y/N]? ' %(host['clear_name']))
                             response = input().lower()
@@ -766,26 +785,42 @@ print(socket.gethostbyname('%s'))
                                     pass
 
                         if jump_host is not None:
+                            utils.debug('Host <{cyan}%s{reset}>: getting host info with jump host <{magenta}%s@%s:%s{reset}>' %(host['clear_name'], jump_host['user'], jump_host['host'], jump_host['port']), 5)
                             hostInfo = self.getHostnameInfo(host['clear_name'], host['port'], jump_host)
+                            utils.debug('Host <{cyan}%s{reset}>: host info: <%s>' %(host['clear_name'], hostInfo), 6)
                             for key in 'clear_name', 'reachable', 'hostname', 'ip', 'port', 'jump_host':
                                 host[key] = hostInfo[key]
 
                         if not host['reachable']:
+                            utils.debug('Host <{cyan}%s{reset}>: host is still unreachable.' %(host['clear_name']), 5)
                             self.__still_unreachable_hosts.append(host)
 
                     if host['ip'] is not None and host['reachable']:
+                        utils.debug('Host <{cyan}%s{reset}>: resolved with IP <{cyan}%s{reset}> and reachable' %(host['clear_name'], host['ip']), 5)
                         try:
                             hostTarget = host['ip']
                             if host['hostname'] is not None:
                                 hostTarget = host['hostname']
+                            msg = 'Host <{cyan}%s{reset}>: trying to connect to <{cyan}%s:%s{reset}>' %(host['clear_name'], hostTarget, host['port'])
+                            if jump_host is not None:
+                                msg += ', using jump host <{magenta}%s@%s:%s{reset}>' %(jump_host['user'], jump_host['host'], jump_host['port'])
+                            utils.debug(msg, 5)
                             self.fakeConnect(hostTarget, port=host['port'], jump_host=jump_host)
                         except paramiko.BadHostKeyException as e:
+                            utils.debug('Host <{cyan}%s{reset}>: got paramiko.BadHostKeyException exception' %(host['clear_name']), 5)
                             if self.__host_keys_backup_filepath is None:
                                 self.__host_keys_backup_filepath = '%s.old' %(self.__host_keys_filepath)
                                 utils.debug('Making known_hosts file backup copy: %s => %s' %(self.__host_keys_filepath, self.__host_keys_backup_filepath), 1)
                                 with open(self.__host_keys_filepath, 'r') as oldfile, open(self.__host_keys_backup_filepath, 'w') as newfile:
                                     for line in oldfile:
                                         newfile.write(line)
+                                    if os.path.isfile(self.__host_keys_backup_filepath):
+                                        try:
+                                            os.chmod(self.__host_keys_backup_filepath, self.__host_keys_filepath_stats.st_mode)
+                                            if platform.system() != 'Windows':
+                                                os.chown(self.__host_keys_backup_filepath, self.__host_keys_filepath_stats.st_uid, self.__host_keys_filepath_stats.st_gid)
+                                        except Exception as e:
+                                            utils.debug('{red}%s error while trying to chmod/chown %s: %s{reset}' %(type(e), self.__host_keys_backup_filepath, e))
 
                             current_key = e.expected_key
                             newKey = e.key
@@ -814,13 +849,15 @@ print(socket.gethostbyname('%s'))
                                 msg += ' <{pink}%s{green}> SSH key: OK{reset}' %(host['key']['key_type'])
                                 utils.debug(msg)
                         except Exception as e:
-                            pass
+                            utils.debug('Host <{cyan}%s{reset}>: got %s exception: <%s>' %(host['clear_name'], type(e), e), 5)
 
                     if host['clear_name'] is not None and host['key'] is not None:
+                        utils.debug('Host <{cyan}%s{reset}>: saving the host as being seen (with key string <{pink}%s{reset}>)' %(host['clear_name'], host['key']['key_string']), 5)
                         self.__seen_keys[host['key']['key_string']] = host
 
             for host in self.__known_hosts:
                 if self.__known_hosts[host]['clear_name'] is None:
+                    utils.debug('Host <{cyan}%s{reset}>: Host is still unknown' %(self.__known_hosts[host]['name']), 5)
                     self.__unknown_hosts.append(self.__known_hosts[host])
 
             if unhashed_known_hosts_filepath is not None:
